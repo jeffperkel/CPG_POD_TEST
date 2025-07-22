@@ -8,7 +8,7 @@ import subprocess
 import threading
 import time
 import os
-# import psutil # Removed psutil to simplify startup
+import psutil # Added psutil back for potentially more robust process checking
 
 # --- Global variable to hold the FastAPI process ---
 # This global variable will store the Popen object.
@@ -169,8 +169,75 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# --- Data Caching Functions ---
+@st.cache_data(ttl=3600)
+def get_master_data():
+    if not api_ready: # Check if API is ready before making a call
+        return {"skus": [], "retailers": []}
+    try:
+        response = requests.get(f"{api_base_url}/master_data")
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        st.error(f"Could not load master data. API Connection Error: {e}")
+        return {"skus": [], "retailers": []}
+
+@st.cache_data(ttl=60)
+def get_summary_data(include_future: bool):
+    if not api_ready: # Check if API is ready before making a call
+        return pd.DataFrame() # Return empty DF if API not ready
+    try:
+        response = requests.get(f"{api_base_url}/summary_table_query", params={"include_future": include_future}, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        result_dict = data.get('result', {})
+        
+        if not result_dict: return pd.DataFrame()
+
+        # Complex parsing logic to handle potential Series/DataFrame and MultiIndex issues
+        index_map = {}
+        for key_str, value in result_dict.items():
+            try:
+                parsed_key = ast.literal_eval(key_str)
+                if isinstance(parsed_key, tuple) and len(parsed_key) > 1:
+                    index_map[parsed_key] = value
+                else:
+                    index_map[key_str] = value
+            except (ValueError, SyntaxError):
+                index_map[key_str] = value
+
+        if not index_map: return pd.DataFrame()
+
+        df_for_processing = None
+        if isinstance(next(iter(index_map)), tuple) and len(next(iter(index_map))) > 1:
+            try:
+                multi_index = pd.MultiIndex.from_tuples(index_map.keys(), names=['Product', 'Retailer'])
+                s = pd.Series(index_map.values(), index=multi_index)
+                
+                pivot_df = s.unstack(level='Retailer').fillna(0).astype(int)
+                if not pivot_df.empty:
+                    pivot_df['Grand Total'] = pivot_df.sum(axis=1)
+                    pivot_df.loc['Grand Total'] = pivot_df.sum(axis=0)
+                df_for_processing = pivot_df
+            except Exception as e:
+                st.error(f"Error processing summary data into MultiIndex DataFrame: {e}")
+                return pd.DataFrame()
+        else:
+            s = pd.Series(index_map.values(), index=pd.Index([str(idx) for idx in index_map.keys()], name='Dimension'))
+            pivot_df = pd.DataFrame(s).transpose()
+            if not pivot_df.empty:
+                pivot_df['Grand Total'] = pivot_df.sum(axis=1)
+                pivot_df.loc['Grand Total'] = pivot_df.sum(axis=0)
+            df_for_processing = pivot_df
+        
+        return df_for_processing
+
+    except requests.exceptions.RequestException as e:
+        st.warning(f"Could not connect to API to fetch detailed data for summary. Error: {e}")
+        return None # Return None to indicate a connection failure
+
+
 # --- API Startup and Status Check ---
-# Ensure this is called early to establish the API status before rendering UI elements
 api_ready = check_and_start_api_if_needed()
 
 # --- Sidebar ---
@@ -181,7 +248,7 @@ if api_ready:
     
     # --- Data Entry Form ---
     st.sidebar.header("Log a New Transaction")
-    master_data = get_master_data() # Fetch master data only if API is ready
+    master_data = get_master_data() # Fetch master data here
 
     with st.sidebar.form("transaction_form", clear_on_submit=True):
         st.markdown("Enter details of the POD change.")
@@ -225,7 +292,7 @@ if api_ready:
             with st.spinner("Processing file..."):
                 files = {'file': (uploaded_file.name, uploaded_file.getvalue(), 'text/csv')}
                 try:
-                    response = requests.post(f"{api_base_url}/transactions/bulk_upload", files=files, timeout=60) # Longer timeout for bulk
+                    response = requests.post(f"{api_base_url}/transactions/bulk_upload", files=files, timeout=60)
                     if response.status_code == 200:
                         result = response.json()
                         st.sidebar.success(f"Bulk add complete! Logged {result['successful_logs']} transactions.")

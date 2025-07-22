@@ -281,8 +281,6 @@ def get_export_data_for_both_views():
     Fetches data for both current and future views for Excel export.
     Returns a tuple: (current_data_df, future_data_df)
     """
-    print("\nFetching data for export views...") # This print statement will be removed in final version
-    
     # Fetch current data (include_future=False)
     current_export_plan = {"filters": {}, "group_by": ["product_name", "retailer"], "include_future_dates": False}
     current_data_to_export = execute_query_plan(current_export_plan, include_future_dates_explicit=False)
@@ -296,7 +294,6 @@ def get_export_data_for_both_views():
     if current_data_to_export is not None and not current_data_to_export.empty:
         current_df_processed = _process_for_export(current_data_to_export, "Current Data")
     else:
-        print("No current data found for export.") # This print statement will be removed
         current_df_processed = pd.DataFrame() # Empty DataFrame if no data
 
     # --- Process and format future data ---
@@ -304,10 +301,8 @@ def get_export_data_for_both_views():
     if future_data_to_export is not None and not future_data_to_export.empty:
         future_df_processed = _process_for_export(future_data_to_export, "Future Data")
     else:
-        print("No future data found for export.") # This print statement will be removed
         future_df_processed = pd.DataFrame() # Empty DataFrame if no data
 
-    print("Data fetching for export complete.") # This print statement will be removed
     return current_df_processed, future_df_processed
 
 def _process_for_export(data, view_name):
@@ -320,13 +315,11 @@ def _process_for_export(data, view_name):
     # Convert Series to DataFrame if necessary
     if isinstance(df_for_processing, pd.Series):
         if not isinstance(df_for_processing.index, pd.MultiIndex) or df_for_processing.index.nlevels < 2:
-            print(f"Error in {view_name}: Series index is not a MultiIndex with at least 2 levels. Cannot prepare for unstacking.") # Remove this print
-            return None # Indicate error
+            return None # Indicate error if index is not a MultiIndex suitable for unstacking
         
         # Ensure index names match expected for unstacking ('Product', 'Retailer')
         expected_names = ['Product', 'Retailer']
         if df_for_processing.index.names != expected_names:
-            # print(f"Warning in {view_name}: Series index names mismatch. Resetting to {expected_names}. Current: {df_for_processing.index.names}") # Remove this print
             df_for_processing.index.names = expected_names
         
         df_for_processing = df_for_processing.to_frame()
@@ -338,17 +331,13 @@ def _process_for_export(data, view_name):
             unstack_level = 'Retailer'
         elif len(df_for_processing.index.names) > 1:
             unstack_level = df_for_processing.index.names[-1] # Fallback to last level
-            # print(f"Warning in {view_name}: 'Retailer' not found in index names. Using '{unstack_level}' for unstacking.") # Remove this print
         else:
-            print(f"Error in {view_name}: Cannot determine unstacking level from MultiIndex.") # Remove this print
-            return None
+            return None # Cannot determine unstacking level
     else:
-        print(f"Error in {view_name}: DataFrame index is not a MultiIndex, cannot perform unstacking by retailer.") # Remove this print
-        return None
+        return None # Not a MultiIndex, cannot perform unstacking
     
     if unstack_level is None:
-        print(f"Error in {view_name}: Failed to determine a valid unstacking level.") # Remove this print
-        return None
+        return None # Failed to determine a valid unstacking level
 
     try:
         final_table = df_for_processing.unstack(level=unstack_level).fillna(0).astype(int)
@@ -358,11 +347,9 @@ def _process_for_export(data, view_name):
             final_table['Grand Total'] = final_table.sum(axis=1)
             final_table.loc['Grand Total'] = final_table.sum(axis=0)
         
-        # print(f"Successfully processed {view_name} for export.") # Remove this print
         return final_table
         
     except Exception as e:
-        print(f"Error during {view_name} processing for export: {e}") # Remove this print
         import traceback
         traceback.print_exc()
         return None

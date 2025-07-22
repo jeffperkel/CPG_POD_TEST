@@ -113,24 +113,29 @@ def export_to_excel():
         # Fetch data for both views
         current_data_df, future_data_df = logic.get_export_data_for_both_views()
         
+        # Check if any data was returned for either view
         if (current_data_df is None or current_data_df.empty) and \
            (future_data_df is None or future_data_df.empty):
             raise HTTPException(status_code=404, detail="No data available for export.")
 
         output = BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            # Write Current PODs sheet
             if current_data_df is not None and not current_data_df.empty:
                 current_data_df.to_excel(writer, sheet_name='Current PODs')
             else:
                 pd.DataFrame({'Message': ['No current POD data available']}).to_excel(writer, sheet_name='Current PODs')
 
+            # Write Future PODs sheet
             if future_data_df is not None and not future_data_df.empty:
                 future_data_df.to_excel(writer, sheet_name='Future PODs')
             else:
                 pd.DataFrame({'Message': ['No future POD data available']}).to_excel(writer, sheet_name='Future PODs')
         
-        output.seek(0)
-        return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f"attachment; filename=pod_tracker_report_{datetime.now().strftime('%Y%m%d')}.xlsx"})
+        output.seek(0) # Go to the beginning of the BytesIO buffer
+        return StreamingResponse(output, 
+                                 media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", 
+                                 headers={"Content-Disposition": f"attachment; filename=pod_tracker_report_{datetime.now().strftime('%Y%m%d')}.xlsx"})
     except HTTPException as he: # Re-raise HTTPException to preserve status codes
         raise he
     except Exception as e:

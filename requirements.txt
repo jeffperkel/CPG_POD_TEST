@@ -7,4 +7,4 @@ python-Levenshtein
 openpyxl
 streamlit
 requests
-psutil
+psutil # Added psutil back for potentially more robust process checking
