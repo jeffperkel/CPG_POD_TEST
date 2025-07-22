@@ -1,0 +1,7 @@
+.env
+pods_ledger.db
+__pycache__/
+venv/
+.streamlit/
+*.pyc
+.ipynb_checkpoints/

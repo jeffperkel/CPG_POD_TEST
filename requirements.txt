@@ -1,0 +1,9 @@
+fastapi[all]
+openai
+pandas
+python-dotenv
+thefuzz
+python-Levenshtein
+openpyxl
+streamlit
+requests

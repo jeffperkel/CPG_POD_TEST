@@ -1,0 +1,8 @@
+Product,Retailer,Quantity,Status,Date
+Family Size Oreos,Walmart,4500,live,2024-01-15
+Family Size Oreos,Walmart,-100,lost,2024-02-01
+12oz Cheerios,Target,1900,live,2024-03-10
+12oz Cheerios,Target,-250,lost,2024-04-05
+12oz Honey Nut Cheerios,Kroger,2500,authorized,2024-05-20
+18oz Quaker Oats,Costco,500,live,2024-01-20
+10-pack Coke Zero,Costco,300,planned,2024-12-01
