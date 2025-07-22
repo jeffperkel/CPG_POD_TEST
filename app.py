@@ -15,30 +15,47 @@ import os # NEW IMPORT
 def start_fastapi():
     # Change to the directory where your pod_agent folder is
     # Adjust 'pod_agent.api:app' if your folder/file structure is different
+    # Command to run uvicorn
     cmd = ["uvicorn", "pod_agent.api:app", "--host", "0.0.0.0", "--port", "8000"]
+    
     # Use subprocess.Popen for non-blocking execution
+    # This will run FastAPI in the background
     process = subprocess.Popen(cmd)
-    return process
-
-# Check if FastAPI is already running (e.g., in Streamlit Cloud's reruns)
-# Use a simple flag in session_state or check for process.
-if 'fastapi_process' not in st.session_state:
-    st.session_state.fastapi_process = None
-
-if st.session_state.fastapi_process is None or st.session_state.fastapi_process.poll() is not None:
-    # Start FastAPI in a new thread to avoid blocking Streamlit's main thread
-    # This is crucial for Streamlit Community Cloud deployment
-    # It also implicitly sets API_URL to http://0.0.0.0:8000 which is how containers talk
-    threading.Thread(target=start_fastapi, daemon=True).start()
-    st.session_state.fastapi_process = True # Set a flag that it's attempting to run
     
     # Give FastAPI a moment to start up
     # This is a hack, but often necessary in containerized environments
     time.sleep(3) # Wait for 3 seconds
+    return process
 
-# --- Initial API_URL: This will now refer to the internal FastAPI server ---
-# Streamlit Cloud runs everything within the same container, so localhost works.
-# We must ensure the FastAPI server is configured to listen on 0.0.0.0 (done in start_fastapi)
+# --- CORRECTED: Logic for starting FastAPI process ---
+# Use st.session_state to manage the FastAPI process across Streamlit reruns
+if 'fastapi_process_obj' not in st.session_state:
+    st.session_state.fastapi_process_obj = None
+
+# Only start the FastAPI process if it hasn't been started yet
+# or if the previous process has terminated
+if st.session_state.fastapi_process_obj is None or st.session_state.fastapi_process_obj.poll() is not None:
+    # Starting FastAPI in a new thread is crucial for Streamlit Cloud deployment
+    # as it prevents Streamlit's main thread from being blocked.
+    # The start_fastapi function itself already includes a sleep.
+    # We must ensure the process object is stored.
+    # Use a thread target that runs the subprocess and stores its object
+    def run_and_store_fastapi():
+        proc = start_fastapi()
+        st.session_state.fastapi_process_obj = proc
+
+    # Start the thread. daemon=True ensures it terminates when the main app exits.
+    fastapi_thread = threading.Thread(target=run_and_store_fastapi, daemon=True)
+    fastapi_thread.start()
+    
+    # It's important that Streamlit waits briefly for the FastAPI server to initialize.
+    # The sleep is now inside run_and_store_fastapi which is called by the thread,
+    # so the main thread needs a *brief* moment to allow the thread to actually execute start_fastapi.
+    # This might be tricky. A small delay here might still be needed if `start_fastapi` is too slow
+    # to set the process object before the API calls below.
+    time.sleep(1) # Give the thread a moment to execute `start_fastapi` and set `fastapi_process_obj`
+
+# --- API_URL: This now refers to the internal FastAPI server within the container ---
 API_URL = "http://localhost:8000"
 
 
@@ -90,7 +107,7 @@ def get_summary_data(include_future: bool):
                     else:
                         multi_index = pd.Index([t[0] for t in index_tuples], name='Dimension')
                 else:
-                    multi_index = pd.Index(index_tuples, name='Dimension')
+                     multi_index = pd.Index(index_tuples, name='Dimension')
 
                 s = pd.Series(result_dict.values(), index=multi_index)
                 
@@ -224,7 +241,7 @@ if prompt := st.chat_input(prompt_placeholder):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with chat_container.chat_message("user"):
         st.markdown(prompt)
-    with st.chat_message("assistant"):
+    with chat_container.chat_message("assistant"):
         with st.spinner("Thinking..."):
             try:
                 response = requests.get(f"{API_URL}/chat_query", params={"question": prompt})
