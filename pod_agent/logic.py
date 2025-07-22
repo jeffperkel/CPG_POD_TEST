@@ -174,7 +174,7 @@ def generate_conversational_response(user_query):
     query_plan = generate_query_plan(user_query)
     filters = query_plan.get("filters", {})
     
-    # Extract common filters
+    # Extract relevant filters from the query plan
     filtered_retailer = filters.get("retailer")
     filtered_product = filters.get("product_name")
 
@@ -208,96 +208,43 @@ def generate_conversational_response(user_query):
         # If filters result in no data, report immediately
         return f"I couldn't find any POD data matching your query (Retailer: {filtered_retailer or 'any'}, Product: {filtered_product or 'any'}). Please check the names and try again."
 
-    # --- Logic for different query types ---
-    if is_ranking_query:
-        # This query is asking for a ranking (e.g., highest/lowest SKU)
+
+    # --- Calculate Current Net PODs (for Part 1 of the answer) ---
+    current_mask = df_copy['effective_date'] <= today
+    current_df = df_copy[current_mask]
+    current_net_pods = current_df['quantity_changed'].sum() # Sum directly
+
+
+    # --- Prepare Future State Details (for Part 2 of the answer) ---
+    future_mask = df_copy['effective_date'] > today
+    future_df = df_copy[future_mask].copy() # Ensure a copy
+    
+    future_changes_list_str = ""
+    future_net_change_amount = 0
+
+    if not future_df.empty:
+        # Sort future changes for clear presentation
+        future_df = future_df.sort_values(by='effective_date', ascending=True)
         
-        # We need to calculate current distribution per SKU
-        current_mask = df_copy['effective_date'] <= today
-        current_df_ranked = df_copy[current_mask]
-
-        if current_df_ranked.empty:
-            return f"As of {current_date_str}, there are no POD records available to determine the highest distribution SKU for your query."
-            
-        # Group by product name and sum the quantity_changed
-        sku_distribution = current_df_ranked.groupby('product_name')['quantity_changed'].sum()
-        
-        # Sort to find the highest
-        sku_distribution_sorted = sku_distribution.sort_values(ascending=False)
-
-        if sku_distribution_sorted.empty:
-            return f"As of {current_date_str}, after applying your filters, there are no current PODs to rank."
-
-        highest_sku = sku_distribution_sorted.index[0]
-        highest_sku_value = sku_distribution_sorted.iloc[0]
-
-        # Construct a specific LLM prompt for this type of answer
-        system_prompt = f"""You are a CPG sales analyst providing specific insights.
-You have been given the result of a query to find the SKU with the highest distribution.
-Your task is to present this information clearly and concisely.
-
-User's original query: "{user_query}"
-Current Date: {current_date_str}
-
----
-[PRE-CALCULATED DATA FOR YOUR RESPONSE]
-SKU_With_Highest_Distribution: {highest_sku}
-Current_PODs_For_Highest_SKU: {highest_sku_value}
----
-
-Respond by directly stating which SKU has the highest distribution, followed by its current POD count.
-For example: "As of {current_date_str}, the SKU with the highest distribution is [SKU_With_Highest_Distribution] with {highest_sku_value:,} PODs."
-"""
-        
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_query}
-            ],
-            temperature=0.0
-        )
-        return response.choices[0].message.content
-
+        # Build a concise list of future changes
+        future_changes_lines = []
+        for _, row in future_df.iterrows():
+            change_type = "Loss" if row['quantity_changed'] < 0 else "Gain"
+            future_changes_lines.append(
+                f"- {change_type} of {abs(row['quantity_changed']):,} {row['product_name']} at {row['retailer']} on {row['effective_date'].strftime('%Y-%m-%d')}"
+            )
+        future_changes_list_str = "\n".join(future_changes_lines)
+        future_net_change_amount = future_df['quantity_changed'].sum()
     else:
-        # This is a summary/aggregation query, use the previous logic
-        
-        # Calculate Current Net PODs (for Part 1 of the answer)
-        current_mask = df_copy['effective_date'] <= today
-        current_df = df_copy[current_mask]
-        current_net_pods = current_df['quantity_changed'].sum() # Sum directly
+        future_changes_list_str = "No specific future changes found for this query."
 
 
-        # Prepare Future State Details (for Part 2 of the answer)
-        future_mask = df_copy['effective_date'] > today
-        future_df = df_copy[future_mask].copy() # Ensure a copy
-        
-        future_changes_list_str = ""
-        future_net_change_amount = 0
-
-        if not future_df.empty:
-            # Sort future changes for clear presentation
-            future_df = future_df.sort_values(by='effective_date', ascending=True)
-            
-            # Build a concise list of future changes
-            future_changes_lines = []
-            for _, row in future_df.iterrows():
-                change_type = "Loss" if row['quantity_changed'] < 0 else "Gain"
-                future_changes_lines.append(
-                    f"- {change_type} of {abs(row['quantity_changed']):,} {row['product_name']} at {row['retailer']} on {row['effective_date'].strftime('%Y-%m-%d')}"
-                )
-            future_changes_list_str = "\n".join(future_changes_lines)
-            future_net_change_amount = future_df['quantity_changed'].sum()
-        else:
-            future_changes_list_str = "No specific future changes found for this query."
+    # --- Calculate Overall Future Total (for Part 2 of the answer) ---
+    overall_future_total = current_net_pods + future_net_change_amount
 
 
-        # Calculate Overall Future Total (for Part 2 of the answer)
-        overall_future_total = current_net_pods + future_net_change_amount
-
-
-        # Construct the LLM prompt with pre-calculated data
-        system_prompt = f"""You are a helpful, extremely concise, and accurate CPG sales analyst.
+    # --- Construct the LLM prompt with pre-calculated data ---
+    system_prompt = f"""You are a helpful, extremely concise, and accurate CPG sales analyst.
 You have been provided with precise, pre-calculated data. Your job is to format it into a clear, two-part answer.
 
 User's original query: "{user_query}"
@@ -319,101 +266,103 @@ PART 2: Future State: [Summarize the 'Detailed_Future_Changes_List' concisely. I
 
 Be professional and direct. Do not add any extra information not requested by the user, and do not repeat context.
 """
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_query}
-            ],
-            temperature=0.0
-        )
-        return response.choices[0].message.content
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_query}
+        ],
+        temperature=0.0
+    )
+    return response.choices[0].message.content
 
-def generate_export_dataframe():
-    export_plan = {"filters": {}, "group_by": ["product_name", "retailer"], "include_future_dates": True}
-    data_to_export = execute_query_plan(export_plan, include_future_dates_explicit=True)
+def get_export_data_for_both_views():
+    """
+    Fetches data for both current and future views for Excel export.
+    Returns a tuple: (current_data_df, future_data_df)
+    """
+    print("\nFetching data for export views...") # This print statement will be removed in final version
     
-    # --- Debugging logging for export ---
-    print("\n--- Debugging export_dataframe ---")
-    print(f"Type of data_to_export: {type(data_to_export)}")
+    # Fetch current data (include_future=False)
+    current_export_plan = {"filters": {}, "group_by": ["product_name", "retailer"], "include_future_dates": False}
+    current_data_to_export = execute_query_plan(current_export_plan, include_future_dates_explicit=False)
     
-    if data_to_export is None:
-        print("data_to_export is None. Returning None.")
-        print("------------------------------------")
-        return None
-    
-    if data_to_export.empty:
-        print("data_to_export is empty. Returning None.")
-        print("------------------------------------")
-        return None
+    # Fetch future data (include_future=True)
+    future_export_plan = {"filters": {}, "group_by": ["product_name", "retailer"], "include_future_dates": True}
+    future_data_to_export = execute_query_plan(future_export_plan, include_future_dates_explicit=True)
 
-    # Ensure we are working with a DataFrame for consistent processing
-    df_for_processing = data_to_export
+    # --- Process and format current data ---
+    current_df_processed = None
+    if current_data_to_export is not None and not current_data_to_export.empty:
+        current_df_processed = _process_for_export(current_data_to_export, "Current Data")
+    else:
+        print("No current data found for export.") # This print statement will be removed
+        current_df_processed = pd.DataFrame() # Empty DataFrame if no data
+
+    # --- Process and format future data ---
+    future_df_processed = None
+    if future_data_to_export is not None and not future_data_to_export.empty:
+        future_df_processed = _process_for_export(future_data_to_export, "Future Data")
+    else:
+        print("No future data found for export.") # This print statement will be removed
+        future_df_processed = pd.DataFrame() # Empty DataFrame if no data
+
+    print("Data fetching for export complete.") # This print statement will be removed
+    return current_df_processed, future_df_processed
+
+def _process_for_export(data, view_name):
+    """Helper to process data into the final export table format."""
+    if data is None or data.empty:
+        return pd.DataFrame() # Return empty DataFrame if input is None or empty
+
+    df_for_processing = data
     
-    # If execute_query_plan returned a Series (e.g., simple aggregation), convert it.
+    # Convert Series to DataFrame if necessary
     if isinstance(df_for_processing, pd.Series):
-        print("Detected data_to_export is a Series. Converting to DataFrame for processing.")
-        # We need to ensure the Series has a MultiIndex suitable for unstacking by 'Retailer'.
-        # The execute_query_plan is designed to group by ['product_name', 'retailer'],
-        # so the Series index should be a MultiIndex of (product_name, retailer).
         if not isinstance(df_for_processing.index, pd.MultiIndex) or df_for_processing.index.nlevels < 2:
-            print("Error: Series index is not a MultiIndex with at least 2 levels (expected Product, Retailer). Cannot prepare for unstacking.")
-            print("Series Index:", df_for_processing.index)
-            print("------------------------------------")
-            return None
+            print(f"Error in {view_name}: Series index is not a MultiIndex with at least 2 levels. Cannot prepare for unstacking.") # Remove this print
+            return None # Indicate error
         
-        # Explicitly set index names if they aren't already correct for clarity and robustness
-        # Assuming the levels are Product and Retailer in that order.
-        if df_for_processing.index.names != ['Product', 'Retailer']:
-            print(f"Warning: Series index names were not ['Product', 'Retailer']. Resetting to these names. Current: {df_for_processing.index.names}")
-            df_for_processing.index.names = ['Product', 'Retailer']
+        # Ensure index names match expected for unstacking ('Product', 'Retailer')
+        expected_names = ['Product', 'Retailer']
+        if df_for_processing.index.names != expected_names:
+            # print(f"Warning in {view_name}: Series index names mismatch. Resetting to {expected_names}. Current: {df_for_processing.index.names}") # Remove this print
+            df_for_processing.index.names = expected_names
         
-        # Convert Series to DataFrame, using the Series name (e.g., 'quantity_changed') as the column name
         df_for_processing = df_for_processing.to_frame()
     
-    print("DataFrame prepared for unstacking:")
-    print(f"Index type: {type(df_for_processing.index)}")
-    if isinstance(df_for_processing.index, pd.MultiIndex):
-        print(f"Index names: {df_for_processing.index.names}")
-    else:
-        print("Index is not a MultiIndex.")
-    print("Head of DataFrame:")
-    print(df_for_processing.head())
-    print("------------------------------------")
-
-    # Now, perform the unstacking
+    # Ensure DataFrame index is suitable for unstacking by 'Retailer'
     unstack_level = None
     if isinstance(df_for_processing.index, pd.MultiIndex):
         if 'Retailer' in df_for_processing.index.names:
             unstack_level = 'Retailer'
         elif len(df_for_processing.index.names) > 1:
-            # If 'Retailer' isn't named, try the second-to-last level as a fallback
             unstack_level = df_for_processing.index.names[-1] # Fallback to last level
-            print(f"Warning: 'Retailer' not found in index names. Using '{unstack_level}' for unstacking.")
+            # print(f"Warning in {view_name}: 'Retailer' not found in index names. Using '{unstack_level}' for unstacking.") # Remove this print
         else:
-            print("Error: Cannot determine unstacking level from MultiIndex.")
+            print(f"Error in {view_name}: Cannot determine unstacking level from MultiIndex.") # Remove this print
             return None
     else:
-        print("Error: DataFrame index is not a MultiIndex, cannot perform unstacking by retailer.")
+        print(f"Error in {view_name}: DataFrame index is not a MultiIndex, cannot perform unstacking by retailer.") # Remove this print
         return None
     
     if unstack_level is None:
-        print("Error: Failed to determine a valid unstacking level.")
+        print(f"Error in {view_name}: Failed to determine a valid unstacking level.") # Remove this print
         return None
 
     try:
         final_table = df_for_processing.unstack(level=unstack_level).fillna(0).astype(int)
         
-        # Ensure Grand Totals are calculated correctly
+        # Add Grand Totals
         if not final_table.empty:
             final_table['Grand Total'] = final_table.sum(axis=1)
             final_table.loc['Grand Total'] = final_table.sum(axis=0)
         
-        print("Successfully generated final_table for export.")
+        # print(f"Successfully processed {view_name} for export.") # Remove this print
         return final_table
         
     except Exception as e:
-        print(f"Error during unstacking, fillna, or astype: {e}")
+        print(f"Error during {view_name} processing for export: {e}") # Remove this print
         import traceback
         traceback.print_exc()
         return None
