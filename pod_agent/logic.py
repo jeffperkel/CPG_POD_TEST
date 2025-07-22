@@ -1,7 +1,4 @@
-# pod_agent/logic.py
-
 import os
-from dotenv import load_dotenv
 import json
 import time
 import sqlite3
@@ -26,12 +23,11 @@ def find_best_match(query, valid_choices_list):
     if not query: return None
     best_match, score = process.extractOne(str(query).lower(), valid_choices_list); return best_match if score >= FUZZY_MATCH_THRESHOLD else None
 
-# MODIFIED: Corrected 'status' variable definition
 def validate_and_enrich_data(parsed_data, user_id, source):
     product_input = parsed_data.get("product_name") or parsed_data.get("Product") or parsed_data.get("sku_name")
     retailer_input = parsed_data.get("retailer_name") or parsed_data.get("Retailer")
     quantity_input = parsed_data.get("quantity") or parsed_data.get("Quantity")
-    intent_input = parsed_data.get("status") or parsed_data.get("Status") # This is the user's intent
+    intent_input = parsed_data.get("status") or parsed_data.get("Status")
     date_input = parsed_data.get("effective_date") or parsed_data.get("Date")
     if not all([product_input, retailer_input, quantity_input, intent_input]):
         raise ValueError("Missing one or more required fields.")
@@ -51,7 +47,7 @@ def validate_and_enrich_data(parsed_data, user_id, source):
     intent = str(intent_input).lower()
     quantity = int(quantity_input)
     
-    final_status = "" # This will be the derived status (live, planned, lost)
+    final_status = ""
     quantity_changed = 0
 
     if intent == 'planned':
@@ -118,6 +114,10 @@ def process_bulk_file(file_stream, user_id):
     return len(final_transactions_to_insert), errors
 
 def generate_query_plan(user_query):
+    """
+    Generates a structured JSON query plan from a natural language query.
+    This is used by the UI's dashboard and directly by the API's /query endpoint.
+    """
     db_schema_info = {"columns": ["retailer", "product_name", "division", "status", "effective_date"], "notes": "Map user synonyms: 'customer'->'retailer', 'item'->'product_name'."}
     system_prompt = f"You are a data query planner. Translate a question into JSON with 'filters', 'group_by', and 'include_future_dates' keys. Column names must be from this schema: {json.dumps(db_schema_info)}. Set `include_future_dates` to `true` for reporting/timelines, `false` for current state."
     response = client.chat.completions.create(model="gpt-4o", messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_query}], response_format={"type": "json_object"}, temperature=0)
@@ -171,18 +171,26 @@ def execute_query_plan(query_plan, include_future_dates_explicit: bool):
     return final_results
 
 def generate_conversational_response(user_query):
-    # 1. Get LLM to parse user's intent/filters for precise Python execution
+    # 1. Use LLM to parse user's intent/filters and determine the query type
     query_plan = generate_query_plan(user_query)
     filters = query_plan.get("filters", {})
     
-    # Extract relevant filters from the query plan
+    # Extract common filters
     filtered_retailer = filters.get("retailer")
     filtered_product = filters.get("product_name")
 
-    # 2. Get the full transaction data from the database
+    # --- Determine the type of query and prepare data accordingly ---
+    
+    # Check for ranking or specific entity identification keywords
+    # This is a simplified check; a more robust solution might involve deeper LLM analysis of the *query plan intent*
+    ranking_keywords = ["highest", "lowest", "top", "best", "worst", "most", "least"]
+    is_ranking_query = any(keyword in user_query.lower() for keyword in ranking_keywords)
+    
+    # Get the full transaction data from the database
     df = database.get_all_transactions_as_dataframe()
 
     current_date_str = date.today().strftime("%Y-%m-%d")
+    today = date.today()
 
     # Handle empty database scenario
     if df is None or df.empty:
@@ -191,7 +199,6 @@ def generate_conversational_response(user_query):
     df_copy = df.copy()
     df_copy['effective_date'] = pd.to_datetime(df_copy['effective_date'], errors='coerce').dt.date
     df_copy.dropna(subset=['effective_date'], inplace=True)
-    today = date.today()
 
     # --- Apply initial filters based on user query (retailer/product) to the whole dataset ---
     if filtered_retailer:
@@ -200,77 +207,130 @@ def generate_conversational_response(user_query):
         df_copy = df_copy[df_copy['product_name'].str.contains(filtered_product, case=False, na=False)]
     
     if df_copy.empty:
-        # If filters result in no data, report immediately
         return f"I couldn't find any POD data matching your query (Retailer: {filtered_retailer or 'any'}, Product: {filtered_product or 'any'}). Please check the names and try again."
 
-
-    # --- Calculate Current Net PODs (for Part 1 of the answer) ---
-    current_mask = df_copy['effective_date'] <= today
-    current_df = df_copy[current_mask]
-    current_net_pods = current_df['quantity_changed'].sum() # Sum directly
-
-
-    # --- Prepare Future State Details (for Part 2 of the answer) ---
-    future_mask = df_copy['effective_date'] > today
-    future_df = df_copy[future_mask].copy() # Ensure a copy
-    
-    future_changes_list_str = ""
-    future_net_change_amount = 0
-
-    if not future_df.empty:
-        # Sort future changes for clear presentation
-        future_df = future_df.sort_values(by='effective_date', ascending=True)
+    # --- Logic for different query types ---
+    if is_ranking_query:
+        # This query is asking for a ranking (e.g., highest/lowest SKU)
         
-        # Build a concise list of future changes
-        future_changes_lines = []
-        for _, row in future_df.iterrows():
-            change_type = "Loss" if row['quantity_changed'] < 0 else "Gain"
-            future_changes_lines.append(
-                f"- {change_type} of {abs(row['quantity_changed']):,} {row['product_name']} at {row['retailer']} on {row['effective_date'].strftime('%Y-%m-%d')}"
-            )
-        future_changes_list_str = "\n".join(future_changes_lines)
-        future_net_change_amount = future_df['quantity_changed'].sum()
+        # We need to calculate current distribution per SKU
+        current_mask = df_copy['effective_date'] <= today
+        current_df_ranked = df_copy[current_mask]
+
+        if current_df_ranked.empty:
+            return f"As of {current_date_str}, there are no POD records available to determine the highest distribution SKU for your query."
+            
+        # Group by product name and sum the quantity_changed
+        # We use 'product_name' as it's what the user understands
+        sku_distribution = current_df_ranked.groupby('product_name')['quantity_changed'].sum()
+        
+        # Sort to find the highest
+        sku_distribution_sorted = sku_distribution.sort_values(ascending=False)
+
+        if sku_distribution_sorted.empty:
+            return f"As of {current_date_str}, after applying your filters, there are no current PODs to rank."
+
+        highest_sku = sku_distribution_sorted.index[0]
+        highest_sku_value = sku_distribution_sorted.iloc[0]
+
+        # Construct a specific LLM prompt for this type of answer
+        # The LLM's job is to format this data clearly.
+        system_prompt = f"""You are a CPG sales analyst providing specific insights.
+        You have been given the result of a query to find the SKU with the highest distribution.
+        Your task is to present this information clearly and concisely.
+
+        User's original query: "{user_query}"
+        Current Date: {current_date_str}
+
+        ---
+        [PRE-CALCULATED DATA FOR YOUR RESPONSE]
+        SKU_With_Highest_Distribution: {highest_sku}
+        Current_PODs_For_Highest_SKU: {highest_sku_value}
+        ---
+
+        Respond by directly stating which SKU has the highest distribution, followed by its current POD count.
+        For example: "As of {current_date_str}, the SKU with the highest distribution is [SKU_With_Highest_Distribution] with {highest_sku_value:,} PODs."
+        """
+        
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_query} # Pass the original query for context if needed by the LLM
+            ],
+            temperature=0.0
+        )
+        return response.choices[0].message.content
+
     else:
-        future_changes_list_str = "No specific future changes found for this query."
+        # This is a summary/aggregation query, use the previous logic
+        
+        # Calculate Current Net PODs (for Part 1 of the answer)
+        current_mask = df_copy['effective_date'] <= today
+        current_df = df_copy[current_mask]
+        current_net_pods = current_df['quantity_changed'].sum() # Sum directly
 
 
-    # --- Calculate Overall Future Total (for Part 2 of the answer) ---
-    overall_future_total = current_net_pods + future_net_change_amount
+        # Prepare Future State Details (for Part 2 of the answer)
+        future_mask = df_copy['effective_date'] > today
+        future_df = df_copy[future_mask].copy() # Ensure a copy
+        
+        future_changes_list_str = ""
+        future_net_change_amount = 0
+
+        if not future_df.empty:
+            # Sort future changes for clear presentation
+            future_df = future_df.sort_values(by='effective_date', ascending=True)
+            
+            # Build a concise list of future changes
+            future_changes_lines = []
+            for _, row in future_df.iterrows():
+                change_type = "Loss" if row['quantity_changed'] < 0 else "Gain"
+                future_changes_lines.append(
+                    f"- {change_type} of {abs(row['quantity_changed']):,} {row['product_name']} at {row['retailer']} on {row['effective_date'].strftime('%Y-%m-%d')}"
+                )
+            future_changes_list_str = "\n".join(future_changes_lines)
+            future_net_change_amount = future_df['quantity_changed'].sum()
+        else:
+            future_changes_list_str = "No specific future changes found for this query."
 
 
-    # --- Construct the LLM prompt with pre-calculated data ---
-    system_prompt = f"""You are a helpful, extremely concise, and accurate CPG sales analyst.
-You have been provided with precise, pre-calculated data. Your job is to format it into a clear, two-part answer.
+        # Calculate Overall Future Total (for Part 2 of the answer)
+        overall_future_total = current_net_pods + future_net_change_amount
 
-User's original query: "{user_query}"
 
----
-[PRE-CALCULATED DATA FOR YOUR RESPONSE]
-Current Date: {current_date_str}
-Current_Net_PODs_Calculated: {current_net_pods}
-Overall_Future_Total_Calculated: {overall_future_total}
-Detailed_Future_Changes_List:
-{future_changes_list_str}
----
+        # Construct the LLM prompt with pre-calculated data
+        system_prompt = f"""You are a helpful, extremely concise, and accurate CPG sales analyst.
+        You have been provided with precise, pre-calculated data. Your job is to format it into a clear, two-part answer.
 
-Your response MUST be structured as two parts:
+        User's original query: "{user_query}"
 
-PART 1: As of Today ({current_date_str}), [State the 'Current_Net_PODs_Calculated' clearly. Directly answer the first part of the user's query regarding their current state/totals based on this number].
+        ---
+        [PRE-CALCULATED DATA FOR YOUR RESPONSE]
+        Current Date: {current_date_str}
+        Current_Net_PODs_Calculated: {current_net_pods}
+        Overall_Future_Total_Calculated: {overall_future_total}
+        Detailed_Future_Changes_List:
+        {future_changes_list_str}
+        ---
 
-PART 2: Future State: [Summarize the 'Detailed_Future_Changes_List' concisely. If it contains "No specific future changes", state that. Then, state the 'Overall_Future_Total_Calculated' clearly as the final future total.]
+        Your response MUST be structured as two parts:
 
-Be professional and direct. Do not add any extra information not requested by the user, and do not repeat context.
-"""
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_query}
-        ],
-        temperature=0.0 # Set to 0 for maximum factual response
-    )
-    return response.choices[0].message.content
+        PART 1: As of Today ({current_date_str}), [State the 'Current_Net_PODs_Calculated' clearly. Directly answer the first part of the user's query regarding their current state/totals based on this number].
 
+        PART 2: Future State: [Summarize the 'Detailed_Future_Changes_List' concisely. If it contains "No specific future changes", state that. Then, state the 'Overall_Future_Total_Calculated' clearly as the final future total.]
+
+        Be professional and direct. Do not add any extra information not requested by the user, and do not repeat context.
+        """
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_query}
+            ],
+            temperature=0.0
+        )
+        return response.choices[0].message.content
 
 def generate_export_dataframe():
     export_plan = {"filters": {}, "group_by": ["product_name", "retailer"], "include_future_dates": True}
