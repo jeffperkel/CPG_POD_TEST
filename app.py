@@ -6,14 +6,14 @@ import pandas as pd
 import ast
 from datetime import datetime
 import io
-import subprocess # NEW IMPORT
-import sys # NEW IMPORT
+import subprocess # Ensure this is imported
+import threading # Ensure this is imported
+import time # Ensure this is imported
+import os # Ensure this is imported
+import sys # Ensure this is imported
 
 # --- CORE FastAPI Process Management ---
-# This function starts the FastAPI server process
 def start_fastapi_process():
-    # Command to run uvicorn. It needs to listen on 0.0.0.0 for container accessibility
-    # and explicitly point to the module and app object.
     command = [
         sys.executable, "-m", "uvicorn",
         "pod_agent.api:app",
@@ -22,35 +22,21 @@ def start_fastapi_process():
         "--log-level", "info"
     ]
     
-    # Start the subprocess. Popen ensures it runs in the background.
-    # Set stdout/stderr to PIPE to prevent output from flooding Streamlit logs directly,
-    # though uvicorn's INFO/WARNINGs will still appear.
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return process
 
 # --- Streamlit Session State for FastAPI Process ---
-# Use st.session_state to store the process object across Streamlit reruns.
-# This ensures FastAPI is started only once per Streamlit app session.
 if "fastapi_process_obj" not in st.session_state:
     st.session_state.fastapi_process_obj = None
 
-# If the FastAPI process is not running or has terminated, start it.
-# st.session_state.fastapi_process_obj.poll() is None means it's still running.
-# st.session_state.fastapi_process_obj.poll() is not None means it has terminated.
 if st.session_state.fastapi_process_obj is None or st.session_state.fastapi_process_obj.poll() is not None:
-    # Only start a NEW process if it's not already running or has crashed.
-    # On first run, it will be None. On subsequent reruns, it will be a Popen object.
-    # If .poll() is not None, it means the process exited.
     st.session_state.fastapi_process_obj = start_fastapi_process()
     
-    # Important: Give FastAPI a moment to start up and bind to the port.
-    # This sleep is crucial for the very first connection attempt.
     st.warning("Starting backend API server... Please wait a moment for data to load on first run.")
-    time.sleep(5) # Increased sleep time for robustness in container environment
+    time.sleep(5)
     st.success("Backend API server started!")
 
 # --- API_URL for communication within the container ---
-# Streamlit and FastAPI communicate via localhost within the same container.
 API_URL = "http://localhost:8000"
 
 
@@ -77,7 +63,6 @@ def get_master_data():
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
-        # st.error(f"Could not load master data. Error: {e}. Is the API server running?") # Removed for cleaner UI on initial load
         return {"skus": [], "retailers": []}
 
 @st.cache_data(ttl=60)
@@ -120,7 +105,6 @@ def get_summary_data(include_future: bool):
                 return pd.DataFrame()
         return pd.DataFrame()
     except requests.exceptions.RequestException as e:
-        # st.warning(f"Could not connect to API to fetch detailed data. Error: {e}") # Removed for cleaner UI on initial load
         return None
 
 # --- Main App ---
@@ -213,7 +197,7 @@ summary_df = get_summary_data(include_future=include_future_data)
 if summary_df is not None and not summary_df.empty:
     st.dataframe(summary_df.style.format("{:,}"), use_container_width=True)
 elif summary_df is None:
-    st.info("Attempting to connect to API... Please wait or refresh if the issue persists.") # Changed from warning to info
+    st.info("Attempting to connect to API... Please wait or refresh if the issue persists.")
 else:
     st.info("No POD data found. Add transactions via the sidebar to see the summary.")
 
