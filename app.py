@@ -6,13 +6,17 @@ import pandas as pd
 import ast
 from datetime import datetime
 import io
-import subprocess # Ensure this is imported
-import threading # Ensure this is imported
-import time # Ensure this is imported
-import os # Ensure this is imported
-import sys # Ensure this is imported
+import subprocess
+import threading
+import time
+import os
+import sys
 
-# --- CORE FastAPI Process Management ---
+# Define log file path. This path should be writable within the container.
+# /tmp is a standard writable temporary directory in Linux containers.
+FASTAPI_LOG_FILE = "/tmp/fastapi_startup.log"
+
+# Function to start the FastAPI server
 def start_fastapi_process():
     command = [
         sys.executable, "-m", "uvicorn",
@@ -22,7 +26,11 @@ def start_fastapi_process():
         "--log-level", "info"
     ]
     
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    # Open the log file in write mode
+    with open(FASTAPI_LOG_FILE, "w") as log_file:
+        # Use subprocess.Popen, redirecting stdout and stderr to the log file
+        process = subprocess.Popen(command, stdout=log_file, stderr=log_file, text=True) # text=True for string output
+    
     return process
 
 # --- Streamlit Session State for FastAPI Process ---
@@ -203,6 +211,17 @@ else:
 
 st.divider()
 
+# --- Display FastAPI logs in Streamlit for debugging ---
+st.subheader("FastAPI Backend Logs (for Debugging)")
+if os.path.exists(FASTAPI_LOG_FILE):
+    with open(FASTAPI_LOG_FILE, "r") as f:
+        log_content = f.read()
+    st.code(log_content, language="text")
+else:
+    st.info(f"FastAPI log file not found at {FASTAPI_LOG_FILE}. It might not have started yet or crashed immediately.")
+
+st.divider() # Separate logs from chat
+
 st.header("Ask me about PODs")
 chat_container = st.container(height=400)
 if "messages" not in st.session_state:
@@ -220,7 +239,7 @@ if prompt := st.chat_input(prompt_placeholder):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with chat_container.chat_message("user"):
         st.markdown(prompt)
-    with chat_container.chat_message("assistant"):
+    with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             try:
                 response = requests.get(f"{API_URL}/chat_query", params={"question": prompt})
