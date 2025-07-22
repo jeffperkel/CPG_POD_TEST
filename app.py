@@ -7,29 +7,27 @@ import ast
 from datetime import datetime
 import io
 import subprocess
-import threading
+import threading # No longer strictly needed for this specific final fix, but keeping it as it was there
 import time
 import os
 import sys
 
-# Define log file path. This path should be writable within the container.
-# /tmp is a standard writable temporary directory in Linux containers.
+# Define log file path. /tmp is a standard writable temporary directory in Linux containers.
 FASTAPI_LOG_FILE = "/tmp/fastapi_startup.log"
 
 # Function to start the FastAPI server
 def start_fastapi_process():
+    # REMOVED: --reload flag
     command = [
         sys.executable, "-m", "uvicorn",
         "pod_agent.api:app",
         "--host", "0.0.0.0",
         "--port", "8000",
-        "--log-level", "info"
+        "--log-level", "info" # Keep log level for debugging
     ]
     
-    # Open the log file in write mode
     with open(FASTAPI_LOG_FILE, "w") as log_file:
-        # Use subprocess.Popen, redirecting stdout and stderr to the log file
-        process = subprocess.Popen(command, stdout=log_file, stderr=log_file, text=True) # text=True for string output
+        process = subprocess.Popen(command, stdout=log_file, stderr=log_file, text=True)
     
     return process
 
@@ -239,7 +237,7 @@ if prompt := st.chat_input(prompt_placeholder):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with chat_container.chat_message("user"):
         st.markdown(prompt)
-    with st.chat_message("assistant"):
+    with chat_chat_message("assistant"):
         with st.spinner("Thinking..."):
             try:
                 response = requests.get(f"{API_URL}/chat_query", params={"question": prompt})
