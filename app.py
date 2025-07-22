@@ -6,6 +6,41 @@ import pandas as pd
 import ast
 from datetime import datetime
 import io
+import subprocess # NEW IMPORT
+import threading # NEW IMPORT
+import time # NEW IMPORT
+import os # NEW IMPORT
+
+# Function to start the FastAPI server
+def start_fastapi():
+    # Change to the directory where your pod_agent folder is
+    # Adjust 'pod_agent.api:app' if your folder/file structure is different
+    cmd = ["uvicorn", "pod_agent.api:app", "--host", "0.0.0.0", "--port", "8000"]
+    # Use subprocess.Popen for non-blocking execution
+    process = subprocess.Popen(cmd)
+    return process
+
+# Check if FastAPI is already running (e.g., in Streamlit Cloud's reruns)
+# Use a simple flag in session_state or check for process.
+if 'fastapi_process' not in st.session_state:
+    st.session_state.fastapi_process = None
+
+if st.session_state.fastapi_process is None or st.session_state.fastapi_process.poll() is not None:
+    # Start FastAPI in a new thread to avoid blocking Streamlit's main thread
+    # This is crucial for Streamlit Community Cloud deployment
+    # It also implicitly sets API_URL to http://0.0.0.0:8000 which is how containers talk
+    threading.Thread(target=start_fastapi, daemon=True).start()
+    st.session_state.fastapi_process = True # Set a flag that it's attempting to run
+    
+    # Give FastAPI a moment to start up
+    # This is a hack, but often necessary in containerized environments
+    time.sleep(3) # Wait for 3 seconds
+
+# --- Initial API_URL: This will now refer to the internal FastAPI server ---
+# Streamlit Cloud runs everything within the same container, so localhost works.
+# We must ensure the FastAPI server is configured to listen on 0.0.0.0 (done in start_fastapi)
+API_URL = "http://localhost:8000"
+
 
 st.set_page_config(layout="wide", page_title="POD Tracker Prototype")
 
@@ -19,8 +54,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# --- Constants and API Configuration ---
-API_URL = "http://127.0.0.1:8000"
+# --- Constants and API Configuration (API_URL is defined above) ---
 VALID_ACTIONS = ["Planned", "Lost"]
 
 # --- Data Caching Functions ---
@@ -30,15 +64,13 @@ def get_master_data():
         response = requests.get(f"{API_URL}/master_data")
         response.raise_for_status()
         return response.json()
-    except requests.exceptions.RequestException:
-        st.error("Could not load master data. Is the API server running?")
+    except requests.exceptions.RequestException as e:
+        st.error(f"Could not load master data. Error: {e}. Is the API server running?")
         return {"skus": [], "retailers": []}
 
-# MODIFIED: Call new /summary_table_query endpoint
 @st.cache_data(ttl=60)
 def get_summary_data(include_future: bool):
     try:
-        # Call the new, deterministic endpoint
         response = requests.get(f"{API_URL}/summary_table_query", params={"include_future": include_future})
         response.raise_for_status()
         data = response.json()
@@ -58,7 +90,7 @@ def get_summary_data(include_future: bool):
                     else:
                         multi_index = pd.Index([t[0] for t in index_tuples], name='Dimension')
                 else:
-                     multi_index = pd.Index(index_tuples, name='Dimension')
+                    multi_index = pd.Index(index_tuples, name='Dimension')
 
                 s = pd.Series(result_dict.values(), index=multi_index)
                 
@@ -75,12 +107,14 @@ def get_summary_data(include_future: bool):
                 st.error(f"Could not parse pivot data from API: {e}")
                 return pd.DataFrame()
         return pd.DataFrame()
-    except requests.exceptions.RequestException:
+    except requests.exceptions.RequestException as e:
+        st.warning(f"Could not connect to API to fetch detailed data. Error: {e}")
         return None
 
-# --- (The rest of app.py is unchanged) ---
+# --- Main App ---
 st.title("POD tracking Prototype")
 
+# --- Sidebar for Data Entry ---
 st.sidebar.header("Log a New Transaction")
 master_data = get_master_data()
 
@@ -136,6 +170,7 @@ if uploaded_file is not None:
             except requests.exceptions.RequestException as e:
                 st.sidebar.error(f"Connection Error: {e}")
 
+# --- Main Page Layout ---
 st.header("POD Summaries")
 
 view_option = st.radio(
@@ -159,15 +194,14 @@ with col2:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True
             )
-    except requests.exceptions.RequestException:
-        st.warning("API connection failed.")
+    except requests.exceptions.RequestException as e:
+        st.warning(f"API connection failed for Excel export: {e}")
 
-# MODIFIED: Pass the view option directly to get_summary_data
 summary_df = get_summary_data(include_future=include_future_data)
 if summary_df is not None and not summary_df.empty:
     st.dataframe(summary_df.style.format("{:,}"), use_container_width=True)
 elif summary_df is None:
-    st.warning("Could not connect to API to fetch detailed data.")
+    st.warning("Could not connect to API to fetch detailed data for summary.")
 else:
     st.info("No POD data found. Add transactions via the sidebar to see the summary.")
 
@@ -190,7 +224,7 @@ if prompt := st.chat_input(prompt_placeholder):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with chat_container.chat_message("user"):
         st.markdown(prompt)
-    with chat_container.chat_message("assistant"):
+    with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             try:
                 response = requests.get(f"{API_URL}/chat_query", params={"question": prompt})
