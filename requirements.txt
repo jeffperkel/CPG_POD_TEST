@@ -8,8 +8,9 @@ openai
 thefuzz
 python-multipart
 openpyxl
-psycopg2-binary  # <-- Driver for PostgreSQL
-SQLAlchemy       # <-- Helps manage database connections
+psycopg2-binary
+SQLAlchemy
 streamlit
 requests
 psutil
+toml  # <-- ADD THIS LINE
