@@ -1,33 +1,39 @@
 # pod_agent/database.py
 
 import os
-import streamlit as st # Import Streamlit to access secrets
 import pandas as pd
 from sqlalchemy import create_engine, text, inspect
+from sqlalchemy.exc import OperationalError
 
-# --- NEW: Use SQLAlchemy to create a connection to your cloud PostgreSQL DB ---
-# It fetches the connection string from Streamlit's secrets manager.
-try:
-    DB_URL = st.secrets["DB_CONNECTION_STRING"]
-    engine = create_engine(DB_URL)
-except Exception as e:
-    # This will show a clear error on the Streamlit page if secrets are not set
-    st.error("🚨 Database connection string not found. Please set `DB_CONNECTION_STRING` in your Streamlit secrets.")
-    # Set engine to None to prevent further errors
-    engine = None
+# --- CORRECTED & ROBUST DATABASE CONNECTION ---
+# Read the database connection URL from an environment variable.
+# Streamlit Cloud will provide this variable to the running application.
+DB_URL = os.environ.get("DB_CONNECTION_STRING")
+engine = None
+
+if DB_URL:
+    try:
+        engine = create_engine(DB_URL)
+        # Test the connection to fail fast if the URL is wrong
+        with engine.connect() as conn:
+            print("✅ Database connection successful.")
+    except OperationalError as e:
+        print(f"🚨 DATABASE CONNECTION FAILED: {e}")
+        print("Please ensure the DB_CONNECTION_STRING is set correctly in your Streamlit Cloud secrets.")
+        engine = None
+else:
+    print("🚨 DB_CONNECTION_STRING environment variable not found.")
+    print("The application will not be able to connect to the database.")
 
 def init_db_and_seed():
     if engine is None:
-        print("❌ Database engine is not initialized. Skipping DB setup.")
+        print("❌ Database engine not initialized. Skipping DB setup.")
         return
 
-    # The inspector checks the database for existing tables
     inspector = inspect(engine)
     tables = inspector.get_table_names()
 
-    # Use a connection from the engine
     with engine.connect() as conn:
-        # PostgreSQL uses SERIAL for auto-incrementing primary keys
         if 'skus' not in tables:
             print("🔧 Creating 'skus' table...")
             conn.execute(text("""
@@ -68,11 +74,20 @@ def init_db_and_seed():
             """))
             conn.commit()
 
-        # Seeding data (only if tables are empty)
         if conn.execute(text("SELECT COUNT(*) FROM skus")).scalar() == 0:
             print("🌱 Seeding SKUs master data...")
             initial_skus = {
-                # (Same initial_skus dictionary as before)
+                "18oz quaker oats": "03000001041", "12oz honey nut cheerios": "01600027526", "12oz cheerios": "01600027525",
+                "family size oreos": "04400003327", "10-pack coke zero": "04900003075", "doritos nacho cheese 9.75oz": "02840009089", 
+                "tostitos scoops 10oz": "02840006797", "pepsi 12-pack": "01200080994", "gatorade lemon-lime 28oz": "05200033812",
+                "tropicana orange juice 52oz": "04850000574", "starbucks frap vanilla 4-pack": "01200081321",
+                "ben & jerrys chocolate fudge brownie": "07684010129", "haagen-dazs vanilla 14oz": "07457002100",
+                "diGiorno rising crust pepperoni pizza": "07192100613", "tide pods 3-in-1 72ct": "03700087535",
+                "clorox disinfecting wipes 75ct": "04460030623", "colgate total toothpaste 4.8oz": "03500052020",
+                "kraft mac & cheese 7.25oz": "02100065883", "heinz tomato ketchup 32oz": "01300000046",
+                "campbells chicken noodle soup": "05100001251", "barilla spaghetti 1lb": "07680850001",
+                "yoplait strawberry yogurt 6oz": "07047000300", "philadelphia cream cheese 8oz": "02100061221",
+                "kelloggs frosted flakes 13.5oz": "03800020108", "pampers swaddlers diapers size 1": "03700074301",
             }
             sku_df = pd.DataFrame(initial_skus.items(), columns=['product_name', 'sku_id'])
             sku_df.to_sql('skus', conn, if_exists='append', index=False)
@@ -80,13 +95,17 @@ def init_db_and_seed():
         if conn.execute(text("SELECT COUNT(*) FROM retailers")).scalar() == 0:
             print("🌱 Seeding Retailers master data...")
             initial_retailers = {
-                # (Same initial_retailers dictionary as before)
+                "walmart": {"retailer": "Walmart", "division": "National"}, "target": {"retailer": "Target", "division": "National"},
+                "kroger": {"retailer": "Kroger", "division": "National"}, "costco": {"retailer": "Costco", "division": "National"},
+                "whole foods": {"retailer": "Whole Foods", "division": "National"}, "aldi": {"retailer": "Aldi", "division": "National"},
+                "publix": {"retailer": "Publix", "division": "Southeast"}, "h-e-b": {"retailer": "H-E-B", "division": "Southwest"},
+                "safeway": {"retailer": "Safeway", "division": "West"}, "albertsons": {"retailer": "Albertsons", "division": "West"},
+                "wegmans": {"retailer": "Wegmans", "division": "Northeast"}, "stop & shop": {"retailer": "Stop & Shop", "division": "Northeast"},
+                "sprouts": {"retailer": "Sprouts", "division": "National"}, "7-eleven": {"retailer": "7-Eleven", "division": "Convenience"},
             }
             retailer_list = [(k, v['retailer'], v['division']) for k, v in initial_retailers.items()]
             retailer_df = pd.DataFrame(retailer_list, columns=['retailer_key', 'retailer_name', 'division'])
             retailer_df.to_sql('retailers', conn, if_exists='append', index=False)
-
-# --- All functions below are refactored to use the SQLAlchemy engine ---
 
 def get_master_data_from_db(table_name, key_column):
     if engine is None: return []
@@ -111,45 +130,33 @@ def get_info_from_names(product_name: str, retailer_key: str):
 def check_for_duplicate(transaction_data):
     if engine is None: return False
     with engine.connect() as conn:
-        sql = text("""
-            SELECT COUNT(*) FROM transactions 
-            WHERE sku_id = :sku_id AND retailer_id = :retailer_id 
-            AND quantity_changed = :qty AND effective_date = :eff_date
-        """)
-        params = {
-            "sku_id": transaction_data['sku_id'], "retailer_id": transaction_data['retailer_id'],
-            "qty": transaction_data['quantity_changed'], "eff_date": transaction_data['effective_date']
-        }
-        count = conn.execute(sql, params).scalar()
+        sql = text("SELECT COUNT(*) FROM transactions WHERE sku_id = :sku_id AND retailer_id = :retailer_id AND quantity_changed = :qty AND effective_date = :eff_date")
+        count = conn.execute(sql, {"sku_id": transaction_data['sku_id'], "retailer_id": transaction_data['retailer_id'], "qty": transaction_data['quantity_changed'], "eff_date": transaction_data['effective_date']}).scalar()
         return count > 0
 
 def insert_transaction(transaction_data):
     if engine is None: raise ConnectionError("Database not connected")
     with engine.connect() as conn:
-        sql = text("""
-            INSERT INTO transactions (trx_id, sku_id, retailer_id, status, quantity_changed, effective_date, log_timestamp, user_id, source) 
-            VALUES (:trx_id, :sku_id, :retailer_id, :status, :qty, :eff_date, :log_ts, :user, :src)
-        """)
-        params = {
-            "trx_id": transaction_data['trx_id'], "sku_id": transaction_data['sku_id'], "retailer_id": transaction_data['retailer_id'],
-            "status": transaction_data['status'], "qty": transaction_data['quantity_changed'], "eff_date": transaction_data['effective_date'],
-            "log_ts": transaction_data['log_timestamp'], "user": transaction_data['user_id'], "src": transaction_data['source']
-        }
+        sql = text("INSERT INTO transactions (trx_id, sku_id, retailer_id, status, quantity_changed, effective_date, log_timestamp, user_id, source) VALUES (:trx_id, :sku_id, :retailer_id, :status, :qty, :eff_date, :log_ts, :user, :src)")
+        params = {"trx_id": transaction_data['trx_id'], "sku_id": transaction_data['sku_id'], "retailer_id": transaction_data['retailer_id'], "status": transaction_data['status'], "qty": transaction_data['quantity_changed'], "eff_date": transaction_data['effective_date'], "log_ts": transaction_data['log_timestamp'], "user": transaction_data['user_id'], "src": transaction_data['source']}
         conn.execute(sql, params)
         conn.commit()
 
 def get_all_transactions_as_dataframe():
     if engine is None: return pd.DataFrame()
-    query = """
-        SELECT
-            t.trx_id, s.product_name, r.retailer_name as retailer, r.division,
-            t.status, t.quantity_changed, t.effective_date, t.log_timestamp,
-            t.user_id, t.source
-        FROM transactions t
-        JOIN skus s ON t.sku_id = s.id
-        JOIN retailers r ON t.retailer_id = r.id
-    """
+    query = text("SELECT t.trx_id, s.product_name, r.retailer_name as retailer, r.division, t.status, t.quantity_changed, t.effective_date, t.log_timestamp, t.user_id, t.source FROM transactions t JOIN skus s ON t.sku_id = s.id JOIN retailers r ON t.retailer_id = r.id")
     with engine.connect() as conn:
         return pd.read_sql_query(sql=query, con=conn)
 
-# (The remaining functions `get_recent_transactions` and `get_total_for_item_by_date` would be refactored similarly)
+def get_recent_transactions(limit=100):
+    if engine is None: return pd.DataFrame()
+    query = text("SELECT t.log_timestamp, t.effective_date, s.product_name, r.retailer_name as retailer, t.quantity_changed, t.status, t.user_id, t.source FROM transactions t JOIN skus s ON t.sku_id = s.id JOIN retailers r ON t.retailer_id = r.id ORDER BY t.log_timestamp DESC LIMIT :limit")
+    with engine.connect() as conn:
+        return pd.read_sql_query(sql=query, con=conn, params={"limit": limit})
+
+def get_total_for_item_by_date(sku_id: int, retailer_id: int, effective_date: str):
+    if engine is None: return 0
+    with engine.connect() as conn:
+        sql = text("SELECT SUM(quantity_changed) FROM transactions WHERE sku_id = :sku_id AND retailer_id = :retailer_id AND effective_date <= :eff_date")
+        result = conn.execute(sql, {"sku_id": sku_id, "retailer_id": retailer_id, "eff_date": effective_date}).scalar()
+        return result if result is not None else 0
