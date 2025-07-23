@@ -4,14 +4,12 @@ import os
 from dotenv import load_dotenv
 import json
 import time
-import sqlite3
 from openai import OpenAI
 import pandas as pd
 from datetime import datetime, date
 from thefuzz import process
 from . import database
 
-# --- This part is unchanged ---
 load_dotenv()
 client = OpenAI()
 FUZZY_MATCH_THRESHOLD = 80
@@ -38,14 +36,10 @@ def validate_and_enrich_data(parsed_data, user_id, source):
     if not all([product_input, retailer_input, quantity_input, intent_input]):
         raise ValueError("Missing one or more required fields: product, retailer, quantity, status.")
 
-    # For retailers, we need to match against the user-friendly 'retailer_name'
     valid_retailer_names = database.get_master_data_from_db('retailers', 'retailer_name')
     matched_retailer_name = find_best_match(retailer_input, valid_retailer_names)
     if not matched_retailer_name: raise ValueError(f"Invalid Retailer: '{retailer_input}'.")
 
-    # We need a way to get the 'retailer_key' from the 'retailer_name' to query the DB
-    # Let's add this to the database module. For now, we'll handle it here.
-    # This is inefficient but will work. A better solution is a new DB function.
     all_retailers_df = pd.DataFrame(database.get_master_data_from_db('retailers', '*'), columns=['id', 'retailer_key', 'retailer_name', 'division'])
     retailer_key_row = all_retailers_df[all_retailers_df['retailer_name'] == matched_retailer_name]
     if retailer_key_row.empty: raise ValueError(f"Could not map retailer name '{matched_retailer_name}' to a key.")
@@ -87,8 +81,7 @@ def validate_and_enrich_data(parsed_data, user_id, source):
 def process_new_transaction(validated_data):
     if validated_data['quantity_changed'] < 0:
         total_on_effective_date = database.get_total_for_item_by_date(
-            sku_id=validated_data['sku_id'],
-            retailer_id=validated_data['retailer_id'],
+            sku_id=validated_data['sku_id'], retailer_id=validated_data['retailer_id'],
             effective_date=validated_data['effective_date']
         )
         quantity_to_lose = abs(validated_data['quantity_changed'])
@@ -102,55 +95,122 @@ def process_new_transaction(validated_data):
     return True
 
 def process_bulk_file(file_stream, user_id):
-    try: bulk_df = pd.read_csv(file_stream)
-    except Exception as e: raise ValueError(f"Could not parse CSV file: {e}")
-    enriched_transactions = []; errors = []
+    """
+    Processes a bulk CSV file efficiently by fetching master data once and using
+    a single database transaction for all valid rows.
+    """
+    try:
+        bulk_df = pd.read_csv(file_stream)
+        bulk_df.columns = [x.lower().strip() for x in bulk_df.columns]
+    except Exception as e:
+        raise ValueError(f"Could not parse CSV file: {e}")
+
+    print("Fetching master data for bulk validation...")
+    all_skus_df = pd.read_sql("SELECT id, product_name FROM skus", database.engine)
+    all_retailers_df = pd.read_sql("SELECT id, retailer_name FROM retailers", database.engine)
+    
+    sku_lookup = {name.lower(): id for name, id in zip(all_skus_df['product_name'], all_skus_df['id'])}
+    retailer_lookup = {name.lower(): id for name, id in zip(all_retailers_df['retailer_name'], all_retailers_df['id'])}
+
+    enriched_transactions = []
+    errors = []
+
+    print(f"Validating {len(bulk_df)} rows from CSV...")
     for index, row in bulk_df.iterrows():
         try:
-            validated_row = validate_and_enrich_data(row.to_dict(), user_id, source="bulk_upload")
-            enriched_transactions.append(validated_row)
-        except Exception as e: errors.append(f"Row {index + 2}: {e}")
-    if not enriched_transactions: return 0, errors
+            required_cols = ['product_name', 'retailer_name', 'quantity', 'status', 'effective_date']
+            if not all(k in row for k in required_cols):
+                raise ValueError(f"Missing one or more required columns: {', '.join(required_cols)}")
+
+            product_input = str(row['product_name']).lower()
+            retailer_input = str(row['retailer_name']).lower()
+
+            matched_prod_name, prod_score = process.extractOne(product_input, sku_lookup.keys())
+            matched_ret_name, ret_score = process.extractOne(retailer_input, retailer_lookup.keys())
+
+            if prod_score < FUZZY_MATCH_THRESHOLD or ret_score < FUZZY_MATCH_THRESHOLD:
+                raise ValueError(f"Could not reliably match Product '{row['product_name']}' or Retailer '{row['retailer_name']}'")
+
+            sku_id = sku_lookup[matched_prod_name]
+            retailer_id = retailer_lookup[matched_ret_name]
+            
+            validated_date = pd.to_datetime(row['effective_date']).date()
+            intent = str(row['status']).lower()
+            quantity = int(row['quantity'])
+            
+            if intent == 'planned':
+                quantity_changed = abs(quantity)
+                final_status = 'planned' if validated_date > date.today() else 'live'
+            elif intent == 'lost':
+                quantity_changed = -abs(quantity)
+                final_status = 'lost'
+            else:
+                raise ValueError(f"Invalid status: '{row['status']}'. Must be 'planned' or 'lost'.")
+            
+            trx_id = f"{sku_id}-{retailer_id}-{time.time()}"
+
+            enriched_transactions.append({
+                "trx_id": trx_id, "sku_id": sku_id, "retailer_id": retailer_id,
+                "product_name": matched_prod_name.title(), "retailer_name": matched_ret_name.title(),
+                "status": final_status, "quantity_changed": quantity_changed,
+                "effective_date": validated_date.strftime("%Y-%m-%d"),
+                "log_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "user_id": user_id, "source": "bulk_upload"
+            })
+        except Exception as e:
+            errors.append(f"Row {index + 2}: {e}")
+
+    if not enriched_transactions:
+        print("No valid transactions found after validation.")
+        return 0, errors
+
     enriched_transactions.sort(key=lambda x: (x['effective_date'], x['log_timestamp']))
-    temp_state = {}; final_transactions_to_insert = []
+    
+    temp_state = {}
+    final_transactions_to_insert = []
+    print("Performing consistency check for losses...")
     for trx in enriched_transactions:
         key = (trx['sku_id'], trx['retailer_id'])
-        current_total = temp_state.get(key, 0)
+        current_total_in_file = temp_state.get(key, 0)
+        
+        projected_total_in_db = database.get_total_for_item_by_date(trx['sku_id'], trx['retailer_id'], trx['effective_date'])
+        
+        combined_projected_total = projected_total_in_db + current_total_in_file
+
         if trx['quantity_changed'] < 0:
             quantity_to_lose = abs(trx['quantity_changed'])
-            if quantity_to_lose > current_total:
-                errors.append(f"File consistency error on {trx['effective_date']} for '{trx['product_name']}': Trying to lose {quantity_to_lose}, but simulated total is only {current_total}.")
+            if quantity_to_lose > combined_projected_total:
+                errors.append(f"Row for '{trx['product_name']}' on {trx['effective_date']}: Trying to lose {quantity_to_lose}, but projected total (DB + File) is only {combined_projected_total}.")
                 continue
-        temp_state[key] = current_total + trx['quantity_changed']
+        
+        temp_state[key] = current_total_in_file + trx['quantity_changed']
         final_transactions_to_insert.append(trx)
+
     if final_transactions_to_insert:
-        conn = database.engine.connect()
-        trans = conn.begin()
-        try:
-            for trx_data in final_transactions_to_insert:
-                database.insert_transaction(trx_data) # Use the existing single-insert function
-            trans.commit()
-        except Exception as e:
-            trans.rollback()
-            errors.append(f"Database batch insert failed: {e}")
-            final_transactions_to_insert.clear()
-        finally:
-            conn.close()
+        print(f"Attempting to insert {len(final_transactions_to_insert)} valid transactions...")
+        with database.engine.connect() as conn:
+            with conn.begin() as transaction:
+                try:
+                    for trx_data in final_transactions_to_insert:
+                        database.insert_transaction(trx_data, conn=conn)
+                    print("Database insert successful, committing transaction.")
+                except Exception as e:
+                    errors.append(f"Database batch insert failed, rolling back. Error: {e}")
+                    print(f"Database batch insert failed, rolling back. Error: {e}")
+                    transaction.rollback()
+                    return 0, errors
+
     return len(final_transactions_to_insert), errors
 
 def generate_query_plan(user_query):
-    # (Unchanged)
     db_schema_info = {"columns": ["retailer", "product_name", "division", "status", "effective_date"], "notes": "Map user synonyms: 'customer'->'retailer', 'item'->'product_name'."}
     system_prompt = f"You are a data query planner. Translate a question into JSON with 'filters', 'group_by', and 'include_future_dates' keys. Column names must be from this schema: {json.dumps(db_schema_info)}. Set `include_future_dates` to `true` for reporting/timelines, `false` for current state."
     response = client.chat.completions.create(model="gpt-4o", messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_query}], response_format={"type": "json_object"}, temperature=0)
     return json.loads(response.choices[0].message.content)
 
-# --- CORRECTED execute_query_plan ---
 def execute_query_plan(query_plan, include_future_dates_explicit: bool):
     df = database.get_all_transactions_as_dataframe()
-
     group_by_cols = query_plan.get("group_by", [])
-
     if df is None or df.empty:
         if group_by_cols:
             return pd.DataFrame(columns=group_by_cols + ['quantity_changed']).set_index(group_by_cols)
@@ -174,14 +234,10 @@ def execute_query_plan(query_plan, include_future_dates_explicit: bool):
         return pd.DataFrame({'Net PODs': [0]}).set_index('Net PODs')
         
     if group_by_cols:
-        # Ensure all group_by columns exist
         valid_group_cols = [col for col in group_by_cols if col in results_df.columns]
         if not valid_group_cols:
-            # If no valid columns to group by, just sum everything
             total_sum = results_df['quantity_changed'].sum()
             return pd.Series([total_sum], index=['Net PODs'], name='value').to_frame()
-
-        # Perform the group by and sum, then convert to a DataFrame
         final_results = results_df.groupby(valid_group_cols)['quantity_changed'].sum().reset_index()
         return final_results.rename(columns={'quantity_changed': 'value'})
     else:
@@ -189,7 +245,6 @@ def execute_query_plan(query_plan, include_future_dates_explicit: bool):
         return pd.DataFrame({'value': [total_sum]}, index=['Net PODs'])
 
 def generate_conversational_response(user_query):
-    # (Unchanged)
     query_plan = generate_query_plan(user_query)
     filters = query_plan.get("filters", {})
     filtered_retailer = filters.get("retailer")
@@ -240,8 +295,6 @@ Your response MUST be structured as two parts..."""
     response = client.chat.completions.create(model="gpt-4o", messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_query}], temperature=0.0)
     return response.choices[0].message.content
 
-
-# --- CORRECTED get_export_data_for_both_views and helper ---
 def get_export_data_for_both_views():
     current_export_plan = {"filters": {}, "group_by": ["product_name", "retailer"]}
     current_data = execute_query_plan(current_export_plan, include_future_dates_explicit=False)
@@ -257,8 +310,6 @@ def get_export_data_for_both_views():
 def _process_for_export(data_df):
     if data_df is None or data_df.empty or 'value' not in data_df.columns:
         return pd.DataFrame()
-
-    # The data is already a DataFrame with 'product_name', 'retailer', and 'value' columns
     try:
         pivot_table = data_df.pivot(index='product_name', columns='retailer', values='value').fillna(0).astype(int)
         
@@ -273,6 +324,5 @@ def _process_for_export(data_df):
         return pd.DataFrame()
 
 def get_transaction_log():
-    # (Unchanged)
     log_df = database.get_recent_transactions()
     return log_df
