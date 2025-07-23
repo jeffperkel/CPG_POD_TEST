@@ -1,5 +1,4 @@
 # app.py
-
 import streamlit as st
 import pandas as pd
 from datetime import datetime
@@ -8,8 +7,6 @@ from pod_agent import logic, database
 
 st.set_page_config(layout="wide", page_title="POD Tracker Prototype")
 
-# --- INITIALIZATION ---
-# This block runs only once per session, ensuring the DB is set up correctly.
 @st.cache_resource
 def initialize_app():
     try:
@@ -27,9 +24,6 @@ if not app_ready:
     st.warning("Application is not ready due to an initialization error. Please check the logs.")
     st.stop()
 
-
-# --- UI HELPER FUNCTIONS (No longer use requests) ---
-# We now call logic functions directly. Caching is still important.
 @st.cache_data(ttl=3600)
 def get_master_data():
     return {
@@ -44,7 +38,6 @@ def get_summary_data(include_future: bool):
     pivot = logic._process_for_export(results)
     return pivot
 
-# --- SIDEBAR ---
 st.sidebar.markdown("### Actions")
 
 st.sidebar.header("Log a New Transaction")
@@ -65,7 +58,7 @@ with st.sidebar.form("transaction_form", clear_on_submit=True):
                 validated_data = logic.validate_and_enrich_data(payload, "streamlit_user", "ui_form")
                 logic.process_new_transaction(validated_data)
                 st.success("Transaction logged!")
-                st.cache_data.clear() # Clear cache on data change
+                st.cache_data.clear()
             except Exception as e:
                 st.error(f"Error: {e}")
 
@@ -76,7 +69,6 @@ if uploaded_file is not None:
     if st.sidebar.button("Process Bulk File"):
         with st.spinner("Processing file..."):
             try:
-                # We pass the file-like object directly to the logic function
                 success_count, errors = logic.process_bulk_file(uploaded_file, "streamlit_user")
                 st.sidebar.success(f"Bulk add complete! Logged {success_count} transactions.")
                 if errors:
@@ -86,8 +78,6 @@ if uploaded_file is not None:
             except Exception as e:
                 st.sidebar.error(f"A critical error occurred: {e}")
 
-
-# --- MAIN PAGE ---
 st.header("POD Summaries")
 view_option = st.radio("Select View:", ("Current PODs", "Future State"), horizontal=True, index=1)
 include_future = (view_option == "Future State")
