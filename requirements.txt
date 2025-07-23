@@ -1,10 +1,15 @@
-fastapi[all]
-openai
+# requirements.txt
+
+fastapi
+uvicorn
 pandas
 python-dotenv
+openai
 thefuzz
-python-Levenshtein
+python-multipart
 openpyxl
+psycopg2-binary  # <-- Driver for PostgreSQL
+SQLAlchemy       # <-- Helps manage database connections
 streamlit
 requests
-psutil # Added psutil back for potentially more robust process checking
+psutil
