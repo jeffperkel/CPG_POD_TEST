@@ -1,5 +1,6 @@
 # pod_agent/logic.py
 
+# pod_agent/logic.py
 import os
 from dotenv import load_dotenv
 import json
@@ -13,6 +14,18 @@ from . import database
 load_dotenv()
 client = OpenAI()
 FUZZY_MATCH_THRESHOLD = 80
+
+# --- ADD THIS ENTIRE FUNCTION ---
+def find_best_match(query, choices, threshold=FUZZY_MATCH_THRESHOLD):
+    """
+    Finds the best fuzzy match for a query from a list of choices.
+    Returns the best match if its score is above the threshold, otherwise None.
+    """
+    best_match = process.extractOne(query, choices)
+    if best_match and best_match[1] >= threshold:
+        return best_match[0]
+    return None
+# -----------------------------
 
 def validate_and_enrich_data(parsed_data, user_id, source):
     """Validates a single transaction record."""
