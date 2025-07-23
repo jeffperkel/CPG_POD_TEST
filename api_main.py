@@ -132,17 +132,28 @@ async def bulk_upload_transactions(user_id: str = "api_user", file: UploadFile =
         raise HTTPException(status_code=500, detail="An error occurred during bulk processing.")
 
 @app.get("/summary", summary="Get POD Distribution Matrix")
-def get_summary_table(include_future: bool = True):
-    """
-    Returns the main POD summary table, pivoted with products as rows
-    and retailers as columns.
-    """
-    try:
-        df = get_summary_data(include_future) # Uses the same helper as the Streamlit app
-        return {"summary_data": df.to_dict(orient='index')}
-    except Exception as e:
-        logger.exception("Error generating summary table.")
-        raise HTTPException(status_code=500, detail=f"Error in summary query: {e}")
+        def get_summary_table(include_future: bool = True):
+            """
+            Returns the main POD summary table, pivoted with products as rows
+            and retailers as columns.
+            """
+            try:
+                # Create the plan and execute it using the logic module,
+                # just like the old Streamlit app did.
+                plan = {"group_by": ["product_name", "retailer"]}
+                results = logic.execute_query_plan(plan, include_future_dates_explicit=include_future)
+                
+                # Check for empty results before processing
+                if results is None or results.empty:
+                    return {"summary_data": {}}
+                
+                # Process the results into the final pivot table
+                pivot_df = logic._process_for_export(results)
+                
+                return {"summary_data": pivot_df.to_dict(orient='index')}
+            except Exception as e:
+                logger.exception("Error generating summary table.")
+                raise HTTPException(status_code=500, detail=f"Error in summary query: {e}")
 
 @app.post("/chat", summary="Ask a Conversational Question")
 def chat_with_data(query: ChatQuery):
