@@ -4,14 +4,9 @@ import os
 import pandas as pd
 from sqlalchemy import create_engine, text, inspect
 
-# Create a global variable for the engine. It starts as None.
 engine = None
 
 def initialize_database(db_url: str):
-    """
-    Initializes the database engine using the provided URL.
-    This function must be called once at the start of the application.
-    """
     global engine
     if engine is not None:
         print("--- [DB] Database engine is already initialized.")
@@ -27,9 +22,8 @@ def initialize_database(db_url: str):
         with engine.connect() as conn:
             print("--- [DB] ✅ Database engine created and connection successful.")
     except Exception as e:
-        print(f"--- [DB] 🚨 DATABASE CONNECTION FAILED. The URL may be invalid or the DB is down.")
-        print(f"   Error: {e}")
-        engine = None # Ensure engine is None on failure
+        print(f"--- [DB] 🚨 DATABASE CONNECTION FAILED. Error: {e}")
+        engine = None
 
 def init_db_and_seed():
     if engine is None: print("❌ [DB] Engine not initialized. Skipping DB setup."); return
