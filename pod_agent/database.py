@@ -76,19 +76,31 @@ def check_for_duplicate(transaction_data):
         params = {"sku_id": transaction_data['sku_id'], "retailer_id": transaction_data['retailer_id'], "qty": transaction_data['quantity_changed'], "eff_date": transaction_data['effective_date']}
         return conn.execute(sql, params).scalar() > 0
 
-def insert_transaction(transaction_data, conn=None):
-    def _execute(connection):
-        sql = text("INSERT INTO transactions (trx_id, sku_id, retailer_id, status, quantity_changed, effective_date, log_timestamp, user_id, source) VALUES (:trx_id, :sku_id, :retailer_id, :status, :qty, :eff_date, :log_ts, :user, :src)")
-        params = {"trx_id": transaction_data['trx_id'], "sku_id": transaction_data['sku_id'], "retailer_id": transaction_data['retailer_id'], "status": transaction_data['status'], "qty": transaction_data['quantity_changed'], "eff_date": transaction_data['effective_date'], "log_ts": transaction_data['log_timestamp'], "user": transaction_data['user_id'], "src": transaction_data['source']}
-        connection.execute(sql, params)
-    
-    if conn:
-        _execute(conn)
-    else:
-        if engine is None: raise ConnectionError("Database not initialized.")
-        with engine.connect() as connection:
-            with connection.begin():
-                _execute(connection)
+# in pod_agent/database.py
+                
+                def insert_transaction(transaction_data, conn=None):
+                    def _execute(connection):
+                        sql = text("INSERT INTO transactions (trx_id, sku_id, retailer_id, status, quantity_changed, effective_date, log_timestamp, user_id, source) VALUES (:trx_id, :sku_id, :retailer_id, :status, :qty, :eff_date, :log_ts, :user, :src)")
+                        params = {
+                            "trx_id": transaction_data['trx_id'], 
+                            "sku_id": transaction_data['sku_id'], 
+                            "retailer_id": transaction_data['retailer_id'], 
+                            "status": transaction_data['status'], 
+                            "qty": transaction_data['quantity_changed'], # <-- THIS IS THE FIXED LINE
+                            "eff_date": transaction_data['effective_date'], 
+                            "log_ts": transaction_data['log_timestamp'], 
+                            "user": transaction_data['user_id'], 
+                            "src": transaction_data['source']
+                        }
+                        connection.execute(sql, params)
+                    
+                    if conn:
+                        _execute(conn)
+                    else:
+                        if engine is None: raise ConnectionError("Database not initialized.")
+                        with engine.connect() as connection:
+                            with connection.begin():
+                                _execute(connection)
 
 def get_all_transactions_as_dataframe():
     if engine is None: raise ConnectionError("Database not initialized.")
