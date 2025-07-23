@@ -25,7 +25,7 @@ st.markdown("""
 
 api_base_url = "http://localhost:8000"
 
-# --- NEW: Initialize Session State for Process Handle ---
+# --- Initialize Session State for Process Handle ---
 if "fastapi_process" not in st.session_state:
     st.session_state.fastapi_process = None
 
@@ -42,7 +42,7 @@ def start_fastapi_server():
     print("Attempting to start FastAPI server...")
     try:
         cmd = ["uvicorn", "pod_agent.api:app", "--host", "0.0.0.0", "--port", "8000"]
-        # Use DEVNULL to hide subprocess output from Streamlit logs unless needed for deep debugging
+        # Use DEVNULL to hide subprocess output from Streamlit logs for cleaner debugging
         process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         st.session_state.fastapi_process = process
         
@@ -96,7 +96,7 @@ if not api_ready:
     else:
         st.error("Failed to start the backend API. Please check the app logs for details.", icon="🚨")
 
-# --- Data Caching Functions (Unchanged) ---
+# --- Data Caching Functions ---
 @st.cache_data(ttl=3600)
 def get_master_data():
     if not api_ready: return {"skus": [], "retailers": []}
