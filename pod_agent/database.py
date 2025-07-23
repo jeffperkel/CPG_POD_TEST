@@ -3,82 +3,34 @@
 import os
 import pandas as pd
 from sqlalchemy import create_engine, text, inspect
-from sqlalchemy.exc import OperationalError
-import toml
 
-# --- ROBUST DATABASE CONNECTION WITH DEEP SEARCH DEBUGGING ---
-DB_URL = None
+# Create a global variable for the engine. It starts as None.
 engine = None
 
-print("--- [DB] Initializing Database Connection ---")
-print(f"--- [DB] Current Working Directory: {os.getcwd()}")
+def initialize_database(db_url: str):
+    """
+    Initializes the database engine using the provided URL.
+    This function must be called once at the start of the application.
+    """
+    global engine
+    if engine is not None:
+        print("--- [DB] Database engine is already initialized.")
+        return
 
-# Method 1: Environment variables (Primary)
-DB_URL = os.environ.get("DB_CONNECTION_STRING")
-if DB_URL:
-    print("--- [DB] Found DB_CONNECTION_STRING in environment variables.")
+    print("--- [DB] Initializing Database Connection ---")
+    if not db_url:
+        print("--- [DB] 🚨 CRITICAL: No DB_URL was provided.")
+        return
 
-# Method 2: Fallback to find secrets.toml
-else:
-    print("--- [DB] DB_CONNECTION_STRING not in env. Attempting to find secrets.toml.")
-    
-    # Let's try a few common locations first
-    project_root = os.getcwd() # The root of the repo is often the CWD
-    possible_paths = [
-        os.path.join(project_root, ".streamlit", "secrets.toml"),
-        os.path.join(os.path.dirname(project_root), ".streamlit", "secrets.toml"), # One level up
-    ]
-    
-    found_path = None
-    for path in possible_paths:
-        print(f"--- [DB] Checking for secrets file at: {path}")
-        if os.path.exists(path):
-            found_path = path
-            print(f"--- [DB] Found secrets file at: {path}")
-            break
-            
-    if found_path:
-        try:
-            secrets = toml.load(found_path)
-            DB_URL = secrets.get("DB_CONNECTION_STRING")
-            if DB_URL:
-                print("--- [DB] ✅ Successfully loaded DB_CONNECTION_STRING from secrets.toml.")
-            else:
-                print("--- [DB] 🚨 Found secrets.toml, but 'DB_CONNECTION_STRING' key is missing.")
-        except Exception as e:
-            print(f"--- [DB] 🚨 Error parsing secrets.toml: {e}")
-
-# Method 3: If still not found, perform a deep search
-if not DB_URL:
-    print("\n--- [DB] FAILED TO FIND SECRET. INITIATING DEEP FILE SYSTEM SEARCH... ---")
-    start_path = "/" # Start from the absolute root of the container
-    for root, dirs, files in os.walk(start_path):
-        if "secrets.toml" in files:
-            full_path = os.path.join(root, "secrets.toml")
-            print(f"--- [DB] !!! FOUND secrets.toml AT: {full_path} !!! ---")
-            # Try to load it from this newly discovered path
-            try:
-                secrets = toml.load(full_path)
-                DB_URL = secrets.get("DB_CONNECTION_STRING")
-                if DB_URL:
-                    print("--- [DB] ✅ Successfully loaded DB_CONNECTION_STRING from deep search path.")
-                    break # Stop searching once we find it
-            except Exception as e:
-                print(f"--- [DB] 🚨 Error parsing the found secrets.toml: {e}")
-
-# Final connection attempt
-if DB_URL:
     try:
-        engine = create_engine(DB_URL)
+        engine = create_engine(db_url)
         with engine.connect() as conn:
             print("--- [DB] ✅ Database engine created and connection successful.")
     except Exception as e:
-        print(f"--- [DB] 🚨 DATABASE CONNECTION FAILED. The URL may be invalid or the DB is down. Error: {e}")
-        engine = None
-else:
-    print("--- [DB] 🚨 CRITICAL: No DB_CONNECTION_STRING found after all methods. Database is not connected.")
+        print(f"--- [DB] 🚨 DATABASE CONNECTION FAILED. The URL may be invalid or the DB is down.")
+        print(f"   Error: {e}")
+        engine = None # Ensure engine is None on failure
 
-# --- The rest of the file is the same as before ---
 def init_db_and_seed():
     if engine is None: print("❌ [DB] Engine not initialized. Skipping DB setup."); return
     inspector = inspect(engine)
@@ -107,8 +59,7 @@ def init_db_and_seed():
             retailer_list = [(k, v['retailer'], v['division']) for k, v in initial_retailers.items()]
             retailer_df = pd.DataFrame(retailer_list, columns=['retailer_key', 'retailer_name', 'division'])
             retailer_df.to_sql('retailers', conn, if_exists='append', index=False)
-            
-# (The rest of the file is unchanged)
+
 def get_master_data_from_db(table_name, key_column):
     if engine is None: return []
     if key_column == '*':
