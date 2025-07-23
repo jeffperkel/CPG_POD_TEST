@@ -14,9 +14,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from pod_agent import logic, database # Import our platform-agnostic modules
 
-# --- DEPENDENCY INJECTION ---
-# This is the most critical part of the new architecture.
-# We initialize the database module ONCE, right at the start of the Streamlit script.
+# --- DEPENDENCY INJECTION with DETAILED ERROR LOGGING ---
 if "db_initialized" not in st.session_state:
     try:
         db_url = st.secrets["DB_CONNECTION_STRING"]
@@ -26,15 +24,16 @@ if "db_initialized" not in st.session_state:
         st.error("🚨 CRITICAL: DB_CONNECTION_STRING not found in Streamlit secrets.", icon="🔥")
         st.stop()
     except Exception as e:
-        st.error(f"🚨 CRITICAL: Database connection failed: {e}", icon="🔥")
+        # THIS IS THE CRITICAL CHANGE: We now print the raw error.
+        st.error("🚨 CRITICAL: Database connection failed. See the detailed error below.", icon="🔥")
+        st.error(f"RAW DATABASE ERROR: {e}") # This will show the exact SQLAlchemy error.
         st.stop()
 
-# Halt the app if the database engine failed to initialize during the first run.
+# (The rest of the file is identical to the one you already have)
 if database.engine is None:
     st.error("🚨 Database engine could not be created. The application cannot run.", icon="🔥")
     st.stop()
 
-# Now we can safely define our FastAPI app
 api_app = FastAPI(title="CPG POD Tracker Agent API", version="3.0.0")
 
 class NewTransaction(BaseModel):
@@ -44,7 +43,6 @@ class NewTransaction(BaseModel):
     status: str
     effective_date: str = None
 
-# --- API Endpoints ---
 @api_app.get("/")
 def read_root(): return {"message": "Welcome to the CPG POD Tracker API"}
 
@@ -92,7 +90,6 @@ def get_summary_table_query(include_future: bool):
 def chat_with_data(question: str):
     return {"answer": logic.generate_conversational_response(question)}
 
-# --- Uvicorn Server in Background Thread ---
 def run_api():
     uvicorn.run(api_app, host="0.0.0.0", port=8000)
 
@@ -104,7 +101,6 @@ if "api_thread_started" not in st.session_state:
     st.session_state.api_thread_started = True
     print("FastAPI server thread started.")
 
-# --- Streamlit UI Code ---
 st.set_page_config(layout="wide", page_title="POD Tracker Prototype")
 api_base_url = "http://localhost:8000"
 
@@ -138,7 +134,7 @@ with st.sidebar.form("transaction_form", clear_on_submit=True):
         if not all([product, retailer]):
             st.warning("Please fill out all fields.")
         else:
-            payload = {"product_name": product, "retailer_name": retailer, "quantity": quantity, "status": action.lower(), "effective_date": effective_date.strftime("%Y-%m-%d")}
+            payload = {"product_name": product, "retailer_name": retailer, "quantity": quantity, "status": action.lower(), "effective_date": effective_date.strftime("%Y-m-%d")}
             response = requests.post(f"{api_base_url}/transactions", json=payload)
             if response.status_code == 200:
                 st.success("Transaction logged!")
