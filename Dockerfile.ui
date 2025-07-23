@@ -1,0 +1,29 @@
+# Use an official Python runtime as a parent image
+FROM python:3.13-slim-bookworm as builder
+
+# Set the working directory in the container
+WORKDIR /app
+
+# Copy the requirements file into the container at /app
+COPY requirements.txt /app/requirements.txt
+
+# Install dependencies
+# We install dependencies in a separate layer so that Docker can cache them
+# if requirements.txt doesn't change.
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# Copy the Streamlit application code
+# Make sure app.py and any other UI-related files are copied.
+COPY . /app
+
+# Expose the port Streamlit runs on
+EXPOSE 8501
+
+# Command to run the Streamlit application
+# --server.port 8501: specifies the port
+# --server.headless true: allows Streamlit to run without a browser window popping up
+# --server.enableCORS false: recommended for security if not explicitly needed
+# --server.enableXsrfProtection false: potentially needed in Docker environments if you run into issues, but try without first
+# The critical change here is that we are NOT starting uvicorn.
+# The Streamlit app will be configured to talk to the API service directly via http://api:8000.
+CMD ["streamlit", "run", "app.py", "--server.port", "8501", "--server.headless", "true"]

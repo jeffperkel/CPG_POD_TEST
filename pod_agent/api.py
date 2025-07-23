@@ -6,35 +6,50 @@ from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import pandas as pd
-from io import BytesIO # Import BytesIO
+from io import BytesIO
 from datetime import datetime
 
 # Import logic module and database initialization
 from . import logic, database
 
+# IMPORTANT: To apply the new database schema, you may need to delete the
+# 'pods_ledger.db' file before the first run of this updated code.
 database.init_db_and_seed()
-app = FastAPI(title="CPG POD Tracker Agent API", version="1.0.0")
+app = FastAPI(title="CPG POD Tracker Agent API", version="1.1.0") # Version bump!
 
 class NewTransaction(BaseModel):
-    product_name: str; retailer_name: str; quantity: int; status: str; effective_date: str = None
+    product_name: str
+    retailer_name: str
+    quantity: int
+    status: str
+    effective_date: str = None
 
 @app.get("/")
-def read_root(): return {"message": "Welcome to the CPG POD Tracker API"}
+def read_root():
+    return {"message": "Welcome to the CPG POD Tracker API"}
 
 @app.get("/master_data")
 def get_master_data():
     try:
-        valid_skus = logic.database.get_master_data_from_db('skus', 'product_name'); valid_retailers = logic.database.get_master_data_from_db('retailers', 'retailer_key')
+        # Get user-friendly names for the UI dropdowns
+        valid_skus = logic.database.get_master_data_from_db('skus', 'product_name')
+        valid_retailers = logic.database.get_master_data_from_db('retailers', 'retailer_name')
         return {"skus": valid_skus, "retailers": valid_retailers}
-    except Exception as e: raise HTTPException(status_code=500, detail=f"Could not load master data: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not load master data: {e}")
 
 @app.post("/transactions")
 def create_transaction(transaction: NewTransaction, user_id: str = "api_user", source: str = "api"):
     try:
+        # The logic layer now handles all the new complexity internally
         validated_data = logic.validate_and_enrich_data(transaction.dict(), user_id, source)
-        logic.process_new_transaction(validated_data); return {"status": "success", "data": validated_data}
-    except ValueError as e: raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e: raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
+        logic.process_new_transaction(validated_data)
+        # The returned data is now more detailed (includes IDs), which is a good thing
+        return {"status": "success", "data": validated_data}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
 
 @app.get("/transactions/log")
 def get_transactions_log():
@@ -42,6 +57,8 @@ def get_transactions_log():
         log_df = logic.get_transaction_log()
         if log_df is None:
             return []
+        # Convert NaN to None for proper JSON representation
+        log_df = log_df.where(pd.notnull(log_df), None)
         return json.loads(log_df.to_json(orient="records"))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to retrieve transaction log: {e}")
@@ -54,18 +71,16 @@ def get_summary_table_query(include_future: bool):
         
         if results is None: return {"result": {}}
 
-        # Convert index to string representations for JSON serialization
         if isinstance(results.index, pd.MultiIndex):
             results.index = results.index.map(lambda x: str(x))
         elif isinstance(results.index, pd.Index):
             results.index = results.index.map(str)
             
-        return {"result": json.loads(results.to_json())}
+        return {"result": json.loads(results.to_json(default_handler=str))}
     except Exception as e:
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"An internal error occurred during summary table query: {e}")
-
 
 @app.get("/query")
 def query_data(question: str):
@@ -79,7 +94,7 @@ def query_data(question: str):
         elif isinstance(results.index, pd.Index):
             results.index = results.index.map(str)
             
-        return {"query": question, "plan": query_plan, "result": json.loads(results.to_json())}
+        return {"query": question, "plan": query_plan, "result": json.loads(results.to_json(default_handler=str))}
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -87,7 +102,9 @@ def query_data(question: str):
 
 @app.get("/chat_query")
 def chat_with_data(question: str):
-    try: answer = logic.generate_conversational_response(question); return {"answer": answer}
+    try:
+        answer = logic.generate_conversational_response(question)
+        return {"answer": answer}
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -100,7 +117,7 @@ async def bulk_upload_transactions(user_id: str = "api_user", file: UploadFile =
     
     try:
         csv_content = await file.read()
-        csv_stream = BytesIO(csv_content) # Use BytesIO for compatibility with read_csv
+        csv_stream = BytesIO(csv_content)
         
         success_count, errors = logic.process_bulk_file(csv_stream, user_id)
         return {"status": "complete", "successful_logs": success_count, "errors": errors}
@@ -110,36 +127,31 @@ async def bulk_upload_transactions(user_id: str = "api_user", file: UploadFile =
 @app.get("/export/excel")
 def export_to_excel():
     try:
-        # Fetch data for both views
         current_data_df, future_data_df = logic.get_export_data_for_both_views()
         
-        # Check if any data was returned for either view
         if (current_data_df is None or current_data_df.empty) and \
            (future_data_df is None or future_data_df.empty):
             raise HTTPException(status_code=404, detail="No data available for export.")
 
         output = BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            # Write Current PODs sheet
             if current_data_df is not None and not current_data_df.empty:
                 current_data_df.to_excel(writer, sheet_name='Current PODs')
             else:
-                pd.DataFrame({'Message': ['No current POD data available']}).to_excel(writer, sheet_name='Current PODs')
+                pd.DataFrame({'Message': ['No current POD data available']}).to_excel(writer, sheet_name='Current PODs', index=False)
 
-            # Write Future PODs sheet
             if future_data_df is not None and not future_data_df.empty:
                 future_data_df.to_excel(writer, sheet_name='Future PODs')
             else:
-                pd.DataFrame({'Message': ['No future POD data available']}).to_excel(writer, sheet_name='Future PODs')
+                pd.DataFrame({'Message': ['No future POD data available']}).to_excel(writer, sheet_name='Future PODs', index=False)
         
-        output.seek(0) # Go to the beginning of the BytesIO buffer
+        output.seek(0)
         return StreamingResponse(output, 
                                  media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", 
                                  headers={"Content-Disposition": f"attachment; filename=pod_tracker_report_{datetime.now().strftime('%Y%m%d')}.xlsx"})
-    except HTTPException as he: # Re-raise HTTPException to preserve status codes
+    except HTTPException as he:
         raise he
     except Exception as e:
-        # Log the full traceback for unexpected errors
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to generate Excel report: {e}")

@@ -1,0 +1,47 @@
+# docker-compose.yml
+
+version: '3.8' # Specifies the Docker Compose file format version
+
+services:
+  api:
+    build:
+      context: . # Build context is the current directory
+      dockerfile: Dockerfile.api # Specifies the Dockerfile to use for this service
+    container_name: fastapi_api_podtest # Optional: a friendly name for the container
+    ports:
+      - "8000:8000" # Maps host port 8000 to container port 8000
+    networks:
+      - app-network # Connects the API service to a custom network
+    environment:
+      # Set environment variables needed by your API here if any
+      # For example, if you used .env for OpenAI key, you might load it here or pass it directly
+      # OPENAI_API_KEY: ${OPENAI_API_KEY} # Example if using .env file for secrets
+      PYTHONUNBUFFERED: 1 # Recommended for container logs to appear in real-time
+
+  ui:
+    build:
+      context: . # Build context is the current directory
+      dockerfile: Dockerfile.ui # Specifies the Dockerfile to use for this service
+    container_name: streamlit_ui_podtest # Optional: a friendly name for the container
+    ports:
+      - "8501:8501" # Maps host port 8501 to container port 8501 (Streamlit's default)
+    volumes:
+      # Mount the current directory to the container's working directory.
+      # This allows Streamlit to see changes to app.py without rebuilding the image every time during development.
+      # For production, you'd typically build the image with all code included.
+      - .:/app
+    environment:
+      # Crucial: Tell Streamlit app where the API is located.
+      # 'api' is the service name defined above, and 8000 is the port uvicorn listens on.
+      - api_base_url=http://api:8000
+      # Other Streamlit environment variables if needed
+      - PYTHONUNBUFFERED: 1 # Recommended for container logs to appear in real-time
+    depends_on:
+      - api # Ensures the 'api' service starts before 'ui'
+    networks:
+      - app-network # Connects the UI service to the same custom network
+
+# Define the network that connects the services
+networks:
+  app-network:
+    driver: bridge # Standard Docker network driver

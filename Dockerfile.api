@@ -1,0 +1,32 @@
+# Use an official Python runtime as a parent image
+FROM python:3.13-slim-bookworm as builder
+
+# Set the working directory in the container
+WORKDIR /app
+
+# Copy the requirements file into the container at /app
+COPY requirements.txt /app/requirements.txt
+
+# Install dependencies
+# We install dependencies in a separate layer so that Docker can cache them
+# if requirements.txt doesn't change.
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# Copy the rest of the application code
+# This includes the pod_agent directory and app.py (even though app.py isn't used by the API directly,
+# it's part of the project structure. Ensure pod_agent is correctly included)
+COPY . /app
+
+# Make sure pod_agent directory and its contents are copied correctly.
+# If your project structure is different, adjust the COPY command accordingly.
+# For instance, if pod_agent is in the root:
+# COPY pod_agent /app/pod_agent
+
+
+# Expose the port the API will run on
+EXPOSE 8000
+
+# Command to run the application using uvicorn
+# This command will be executed when the container starts.
+# We use 0.0.0.0 to make it accessible from outside the container.
+CMD ["uvicorn", "pod_agent.api:app", "--host", "0.0.0.0", "--port", "8000"]
