@@ -1,246 +1,117 @@
-# app.py
+# pod_agent/database.py
 
-import streamlit as st
-import requests
-import pandas as pd
-import ast
-from datetime import datetime
-import subprocess
-import time
 import os
+import pandas as pd
+from sqlalchemy import create_engine, text, inspect
+import streamlit as st # Import streamlit to access secrets
 
-# --- Streamlit App Configuration ---
-st.set_page_config(layout="wide", page_title="POD Tracker Prototype")
+# --- FINAL, SIMPLIFIED DATABASE CONNECTION for In-Process API ---
+DB_URL = None
+engine = None
 
-# --- Custom CSS ---
-st.markdown("""
-<style>
-    section[data-testid="stSidebar"] {
-        width: 400px !important; 
-    }
-    .api-status-success { color: #14B8A6; font-weight: bold; }
-    .api-status-error { color: #EF4444; font-weight: bold; }
-</style>
-""", unsafe_allow_html=True)
+print("--- [DB] Initializing Database Connection ---")
 
-api_base_url = "http://localhost:8000"
-
-# --- Initialize Session State for Process Handle ---
-if "fastapi_process" not in st.session_state:
-    st.session_state.fastapi_process = None
-
-# --- Helper functions for managing the FastAPI process ---
-
-def is_process_running(process_obj):
-    """Checks if a Popen process object is still running."""
-    if process_obj is None:
-        return False
-    return process_obj.poll() is None
-
-def start_fastapi_server():
-    """Starts the FastAPI server and stores the handle in session state."""
-    print("Attempting to start FastAPI server...")
+if "DB_CONNECTION_STRING" in st.secrets:
+    DB_URL = st.secrets["DB_CONNECTION_STRING"]
+    print("--- [DB] Found DB_CONNECTION_STRING in Streamlit secrets.")
     try:
-        cmd = ["uvicorn", "pod_agent.api:app", "--host", "0.0.0.0", "--port", "8000"]
-        # Use DEVNULL to hide subprocess output from Streamlit logs for cleaner debugging
-        process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        st.session_state.fastapi_process = process
-        
-        # Wait for the API to become responsive
-        max_wait_time = 30 # Increased for cloud environment
-        for i in range(max_wait_time):
-            try:
-                response = requests.get(f"{api_base_url}/", timeout=1)
-                if response.status_code == 200:
-                    print("FastAPI server is running and responsive.")
-                    return True
-            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
-                print(f"Waiting for API... ({i+1}/{max_wait_time})")
-                time.sleep(1)
-                
-        print("FastAPI server failed to become responsive.")
-        stop_fastapi_server()
-        return False
-
+        engine = create_engine(DB_URL)
+        with engine.connect() as conn:
+            print("--- [DB] ✅ Database engine created and connection successful.")
     except Exception as e:
-        print(f"Error during FastAPI startup: {e}")
-        st.session_state.fastapi_process = None
-        return False
+        print(f"--- [DB] 🚨 DATABASE CONNECTION FAILED. Error: {e}")
+        engine = None
+else:
+    print("--- [DB] 🚨 CRITICAL: No DB_CONNECTION_STRING found in Streamlit secrets.")
 
-def stop_fastapi_server():
-    """Stops the FastAPI server using the handle from session state."""
-    process = st.session_state.get("fastapi_process")
-    if is_process_running(process):
-        print("Stopping FastAPI server...")
-        process.terminate()
-        try:
-            process.wait(timeout=5)
-            print("FastAPI server stopped.")
-        except subprocess.TimeoutExpired:
-            process.kill()
-            print("FastAPI server killed.")
-        st.session_state.fastapi_process = None
+# The rest of the file is identical to the one you already have
+# (init_db_and_seed, get_master_data_from_db, etc.)
+def init_db_and_seed():
+    if engine is None: print("❌ [DB] Engine not initialized. Skipping DB setup."); return
+    inspector = inspect(engine)
+    tables = inspector.get_table_names()
+    with engine.connect() as conn:
+        if 'skus' not in tables:
+            print("🔧 Creating 'skus' table...")
+            conn.execute(text("CREATE TABLE skus (id SERIAL PRIMARY KEY, product_name TEXT NOT NULL UNIQUE, sku_id TEXT NOT NULL UNIQUE)"))
+            conn.commit()
+        if 'retailers' not in tables:
+            print("🔧 Creating 'retailers' table...")
+            conn.execute(text("CREATE TABLE retailers (id SERIAL PRIMARY KEY, retailer_key TEXT NOT NULL UNIQUE, retailer_name TEXT NOT NULL, division TEXT)"))
+            conn.commit()
+        if 'transactions' not in tables:
+            print("🔧 Creating 'transactions' table...")
+            conn.execute(text("CREATE TABLE transactions (trx_id TEXT PRIMARY KEY, sku_id INTEGER NOT NULL REFERENCES skus(id), retailer_id INTEGER NOT NULL REFERENCES retailers(id), status TEXT NOT NULL, quantity_changed INTEGER NOT NULL, effective_date DATE NOT NULL, log_timestamp TIMESTAMP NOT NULL, user_id TEXT NOT NULL, source TEXT NOT NULL)"))
+            conn.commit()
+        if conn.execute(text("SELECT COUNT(*) FROM skus")).scalar() == 0:
+            print("🌱 Seeding SKUs master data...")
+            initial_skus = {"18oz quaker oats": "03000001041", "12oz honey nut cheerios": "01600027526", "12oz cheerios": "01600027525", "family size oreos": "04400003327", "10-pack coke zero": "04900003075", "doritos nacho cheese 9.75oz": "02840009089", "tostitos scoops 10oz": "02840006797", "pepsi 12-pack": "01200080994", "gatorade lemon-lime 28oz": "05200033812", "tropicana orange juice 52oz": "04850000574", "starbucks frap vanilla 4-pack": "01200081321", "ben & jerrys chocolate fudge brownie": "07684010129", "haagen-dazs vanilla 14oz": "07457002100", "diGiorno rising crust pepperoni pizza": "07192100613", "tide pods 3-in-1 72ct": "03700087535", "clorox disinfecting wipes 75ct": "04460030623", "colgate total toothpaste 4.8oz": "03500052020", "kraft mac & cheese 7.25oz": "02100065883", "heinz tomato ketchup 32oz": "01300000046", "campbells chicken noodle soup": "05100001251", "barilla spaghetti 1lb": "07680850001", "yoplait strawberry yogurt 6oz": "07047000300", "philadelphia cream cheese 8oz": "02100061221", "kelloggs frosted flakes 13.5oz": "03800020108", "pampers swaddlers diapers size 1": "03700074301"}
+            sku_df = pd.DataFrame(initial_skus.items(), columns=['product_name', 'sku_id'])
+            sku_df.to_sql('skus', conn, if_exists='append', index=False)
+        if conn.execute(text("SELECT COUNT(*) FROM retailers")).scalar() == 0:
+            print("🌱 Seeding Retailers master data...")
+            initial_retailers = {"walmart": {"retailer": "Walmart", "division": "National"}, "target": {"retailer": "Target", "division": "National"}, "kroger": {"retailer": "Kroger", "division": "National"}, "costco": {"retailer": "Costco", "division": "National"}, "whole foods": {"retailer": "Whole Foods", "division": "National"}, "aldi": {"retailer": "Aldi", "division": "National"}, "publix": {"retailer": "Publix", "division": "Southeast"}, "h-e-b": {"retailer": "H-E-B", "division": "Southwest"}, "safeway": {"retailer": "Safeway", "division": "West"}, "albertsons": {"retailer": "Albertsons", "division": "West"}, "wegmans": {"retailer": "Wegmans", "division": "Northeast"}, "stop & shop": {"retailer": "Stop & Shop", "division": "Northeast"}, "sprouts": {"retailer": "Sprouts", "division": "National"}, "7-eleven": {"retailer": "7-Eleven", "division": "Convenience"}}
+            retailer_list = [(k, v['retailer'], v['division']) for k, v in initial_retailers.items()]
+            retailer_df = pd.DataFrame(retailer_list, columns=['retailer_key', 'retailer_name', 'division'])
+            retailer_df.to_sql('retailers', conn, if_exists='append', index=False)
 
-# --- Main API Status Check at the top of each rerun ---
-api_ready = False
-if is_process_running(st.session_state.get("fastapi_process")):
-    try:
-        if requests.get(f"{api_base_url}/", timeout=2).status_code == 200:
-            api_ready = True
-    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
-        stop_fastapi_server()
+def get_master_data_from_db(table_name, key_column):
+    if engine is None: return []
+    if key_column == '*':
+        with engine.connect() as conn:
+            query = text(f"SELECT * FROM {table_name}")
+            return conn.execute(query).fetchall()
+    with engine.connect() as conn:
+        query = text(f"SELECT {key_column} FROM {table_name}")
+        result = conn.execute(query).fetchall()
+        return [item[0] for item in result]
 
-if not api_ready:
-    if start_fastapi_server():
-        api_ready = True
+def get_info_from_names(product_name: str, retailer_key: str):
+    if engine is None: return None
+    with engine.connect() as conn:
+        sku_query = text("SELECT id FROM skus WHERE product_name = :p_name")
+        sku_res = conn.execute(sku_query, {"p_name": product_name}).fetchone()
+        if not sku_res: return None
+        retailer_query = text("SELECT id, retailer_name, division FROM retailers WHERE retailer_key = :r_key")
+        retailer_res = conn.execute(retailer_query, {"r_key": retailer_key}).fetchone()
+        if not retailer_res: return None
+        return {"sku_id": sku_res[0], "retailer_id": retailer_res[0], "retailer_name": retailer_res[1], "division": retailer_res[2]}
+
+def check_for_duplicate(transaction_data):
+    if engine is None: return False
+    with engine.connect() as conn:
+        sql = text("SELECT COUNT(*) FROM transactions WHERE sku_id = :sku_id AND retailer_id = :retailer_id AND quantity_changed = :qty AND effective_date = :eff_date")
+        count = conn.execute(sql, {"sku_id": transaction_data['sku_id'], "retailer_id": transaction_data['retailer_id'], "qty": transaction_data['quantity_changed'], "eff_date": transaction_data['effective_date']}).scalar()
+        return count > 0
+
+def insert_transaction(transaction_data, conn=None):
+    def _execute(connection):
+        sql = text("INSERT INTO transactions (trx_id, sku_id, retailer_id, status, quantity_changed, effective_date, log_timestamp, user_id, source) VALUES (:trx_id, :sku_id, :retailer_id, :status, :qty, :eff_date, :log_ts, :user, :src)")
+        params = {"trx_id": transaction_data['trx_id'], "sku_id": transaction_data['sku_id'], "retailer_id": transaction_data['retailer_id'], "status": transaction_data['status'], "qty": transaction_data['quantity_changed'], "eff_date": transaction_data['effective_date'], "log_ts": transaction_data['log_timestamp'], "user": transaction_data['user_id'], "src": transaction_data['source']}
+        connection.execute(sql, params)
+    if conn:
+        _execute(conn)
     else:
-        st.error("Failed to start the backend API. Please check the app logs for details.", icon="🚨")
+        if engine is None: raise ConnectionError("Database not connected")
+        with engine.connect() as connection:
+            with connection.begin():
+                _execute(connection)
 
-# --- Data Caching Functions ---
-@st.cache_data(ttl=3600)
-def get_master_data():
-    if not api_ready: return {"skus": [], "retailers": []}
-    try:
-        response = requests.get(f"{api_base_url}/master_data")
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        st.error(f"Could not load master data. API Connection Error: {e}")
-        return {"skus": [], "retailers": []}
+def get_all_transactions_as_dataframe():
+    if engine is None: return pd.DataFrame()
+    query = text("SELECT t.trx_id, s.product_name, r.retailer_name as retailer, r.division, t.status, t.quantity_changed, t.effective_date, t.log_timestamp, t.user_id, t.source FROM transactions t JOIN skus s ON t.sku_id = s.id JOIN retailers r ON t.retailer_id = r.id")
+    with engine.connect() as conn:
+        return pd.read_sql_query(sql=query, con=conn)
 
-@st.cache_data(ttl=60)
-def get_summary_data(include_future: bool):
-    if not api_ready: return pd.DataFrame()
-    try:
-        response = requests.get(f"{api_base_url}/summary_table_query", params={"include_future": include_future}, timeout=10)
-        response.raise_for_status()
-        data = response.json().get('result', {})
-        if not data: return pd.DataFrame()
-        df = pd.DataFrame.from_dict(data, orient='index')
-        df.columns = df.columns.astype(str)
-        return df
-    except (requests.exceptions.RequestException, KeyError, ValueError) as e:
-        st.warning(f"Could not fetch or parse summary data. Error: {e}")
-        return pd.DataFrame()
+def get_recent_transactions(limit=100):
+    if engine is None: return pd.DataFrame()
+    query = text("SELECT t.log_timestamp, t.effective_date, s.product_name, r.retailer_name as retailer, t.quantity_changed, t.status, t.user_id, t.source FROM transactions t JOIN skus s ON t.sku_id = s.id JOIN retailers r ON t.retailer_id = r.id ORDER BY t.log_timestamp DESC LIMIT :limit")
+    with engine.connect() as conn:
+        return pd.read_sql_query(sql=query, con=conn, params={"limit": limit})
 
-# --- Sidebar ---
-st.sidebar.header("Actions")
-
-if api_ready:
-    st.sidebar.markdown("<span class='api-status-success'>✅ Backend API is running.</span>", unsafe_allow_html=True)
-    
-    st.sidebar.header("Log a New Transaction")
-    master_data = get_master_data()
-    with st.sidebar.form("transaction_form", clear_on_submit=True):
-        product = st.selectbox("Product Name", sorted(master_data.get("skus", [])), index=None, placeholder="Select...")
-        retailer = st.selectbox("Retailer", sorted(master_data.get("retailers", [])), index=None, placeholder="Select...")
-        quantity = st.number_input("Quantity", min_value=1, step=1)
-        action = st.selectbox("Action", ["Planned", "Lost"], index=0)
-        effective_date = st.date_input("Effective Date", value=datetime.now())
-        submitted = st.form_submit_button("Log Transaction")
-        if submitted:
-            if not all([product, retailer]):
-                st.warning("Please fill out all fields.")
-            else:
-                payload = {"product_name": product, "retailer_name": retailer, "quantity": quantity, "status": action.lower(), "effective_date": effective_date.strftime("%Y-%m-%d")}
-                try:
-                    response = requests.post(f"{api_base_url}/transactions", json=payload, timeout=10)
-                    if response.status_code == 200:
-                        st.success("Transaction logged!")
-                        st.cache_data.clear()
-                        st.rerun()
-                    else:
-                        st.error(f"API Error: {response.json().get('detail', 'Unknown error')}")
-                except requests.exceptions.RequestException as e:
-                    st.error(f"Connection Error: {e}")
-
-    st.sidebar.divider()
-    st.sidebar.header("Bulk Upload Transactions")
-    uploaded_file = st.sidebar.file_uploader("Choose a CSV file", type="csv")
-    if uploaded_file is not None:
-        if st.sidebar.button("Process Bulk File"):
-            with st.spinner("Processing file..."):
-                files = {'file': (uploaded_file.name, uploaded_file.getvalue(), 'text/csv')}
-                try:
-                    response = requests.post(f"{api_base_url}/transactions/bulk_upload", files=files, timeout=60)
-                    if response.status_code == 200:
-                        result = response.json()
-                        st.sidebar.success(f"Bulk add complete! Logged {result['successful_logs']} transactions.")
-                        if result['errors']:
-                            st.sidebar.warning(f"Skipped {len(result['errors'])} transactions:", icon="⚠️")
-                            st.sidebar.json(result['errors'], expanded=False)
-                        st.cache_data.clear()
-                        st.rerun()
-                    else:
-                        st.sidebar.error(f"API Error: {response.json().get('detail', 'Unknown error')}")
-                except requests.exceptions.RequestException as e:
-                    st.sidebar.error(f"Connection Error: {e}")
-else:
-    st.sidebar.markdown("<span class='api-status-error'>❌ Backend API is not running.</span>", unsafe_allow_html=True)
-    if st.sidebar.button("Retry API Connection"):
-        st.rerun()
-
-# --- Main Page Content ---
-st.header("POD Summaries")
-view_option = st.radio("Select View:", ("Current PODs (As of Today)", "Future State (Including All Plans)"), horizontal=True, index=1)
-include_future_data = (view_option == "Future State (Including All Plans)")
-
-col1, col2 = st.columns([3, 1])
-with col1:
-    st.subheader("Distribution Matrix")
-with col2:
-    if api_ready:
-        try:
-            excel_response = requests.get(f"{api_base_url}/export/excel", timeout=30)
-            if excel_response.status_code == 200:
-                st.download_button(
-                    label="📥 Download Excel Report", data=excel_response.content,
-                    file_name=f"pod_tracker_report_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
-        except requests.exceptions.RequestException:
-            st.warning("Export failed: API connection error.")
-
-summary_df = get_summary_data(include_future=include_future_data)
-
-if summary_df is not None and not summary_df.empty:
-    st.dataframe(summary_df.style.format("{:,}"), use_container_width=True)
-elif api_ready:
-    st.info("No POD data found. Add transactions via the sidebar to see the summary.")
-else:
-    st.info("API is not running. Cannot display summary.")
-
-# --- Chat Interface ---
-st.divider()
-st.header("Ask me about PODs")
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-chat_container = st.container(height=400)
-for message in st.session_state.messages:
-    with chat_container.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-if prompt := st.chat_input("How many PODs are planned for January 2026?"):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with chat_container.chat_message("user"):
-        st.markdown(prompt)
-
-    with chat_container.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            if api_ready:
-                try:
-                    response = requests.get(f"{api_base_url}/chat_query", params={"question": prompt}, timeout=60)
-                    response.raise_for_status()
-                    answer = response.json().get("answer", "Sorry, I couldn't get a valid response.")
-                    st.markdown(answer)
-                    st.session_state.messages.append({"role": "assistant", "content": answer})
-                except requests.exceptions.RequestException as e:
-                    error_message = f"Could not connect to the chat API: {e}"
-                    st.error(error_message)
-                    st.session_state.messages.append({"role": "assistant", "content": error_message})
-            else:
-                error_message = "Backend API is not running. Cannot process chat queries."
-                st.error(error_message)
-                st.session_state.messages.append({"role": "assistant", "content": error_message})
+def get_total_for_item_by_date(sku_id: int, retailer_id: int, effective_date: str):
+    if engine is None: return 0
+    with engine.connect() as conn:
+        sql = text("SELECT SUM(quantity_changed) FROM transactions WHERE sku_id = :sku_id AND retailer_id = :retailer_id AND effective_date <= :eff_date")
+        result = conn.execute(sql, {"sku_id": sku_id, "retailer_id": retailer_id, "eff_date": effective_date}).scalar()
+        return result if result is not None else 0
