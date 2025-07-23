@@ -79,6 +79,10 @@ def validate_and_enrich_data(parsed_data, user_id, source):
     }
 
 def process_new_transaction(validated_data):
+    # Add a guard clause here as well for single transactions
+    if database.engine is None:
+        raise ConnectionError("Database is not connected. Cannot process transaction.")
+        
     if validated_data['quantity_changed'] < 0:
         total_on_effective_date = database.get_total_for_item_by_date(
             sku_id=validated_data['sku_id'], retailer_id=validated_data['retailer_id'],
@@ -99,6 +103,12 @@ def process_bulk_file(file_stream, user_id):
     Processes a bulk CSV file efficiently by fetching master data once and using
     a single database transaction for all valid rows.
     """
+    # --- THIS IS THE CRITICAL FIX ---
+    # Add a guard clause to fail fast if the database isn't connected.
+    if database.engine is None:
+        raise ConnectionError("Database is not connected. Cannot process bulk file.")
+    # --- END OF FIX ---
+
     try:
         bulk_df = pd.read_csv(file_stream)
         bulk_df.columns = [x.lower().strip() for x in bulk_df.columns]
@@ -119,8 +129,8 @@ def process_bulk_file(file_stream, user_id):
     for index, row in bulk_df.iterrows():
         try:
             required_cols = ['product_name', 'retailer_name', 'quantity', 'status', 'effective_date']
-            if not all(k in row for k in required_cols):
-                raise ValueError(f"Missing one or more required columns: {', '.join(required_cols)}")
+            if not all(k in row and pd.notna(row[k]) for k in required_cols):
+                raise ValueError(f"Missing data in one of required columns: {', '.join(required_cols)}")
 
             product_input = str(row['product_name']).lower()
             retailer_input = str(row['retailer_name']).lower()
@@ -197,7 +207,7 @@ def process_bulk_file(file_stream, user_id):
                 except Exception as e:
                     errors.append(f"Database batch insert failed, rolling back. Error: {e}")
                     print(f"Database batch insert failed, rolling back. Error: {e}")
-                    transaction.rollback()
+                    # The 'with conn.begin()' automatically rolls back on exception
                     return 0, errors
 
     return len(final_transactions_to_insert), errors
