@@ -25,12 +25,14 @@ st.markdown("""
 
 api_base_url = "http://localhost:8000"
 
+# --- NEW: Initialize Session State for Process Handle ---
 if "fastapi_process" not in st.session_state:
     st.session_state.fastapi_process = None
 
 # --- Helper functions for managing the FastAPI process ---
 
 def is_process_running(process_obj):
+    """Checks if a Popen process object is still running."""
     if process_obj is None:
         return False
     return process_obj.poll() is None
@@ -38,30 +40,14 @@ def is_process_running(process_obj):
 def start_fastapi_server():
     """Starts the FastAPI server and stores the handle in session state."""
     print("Attempting to start FastAPI server...")
-
-    # --- THIS IS THE CRITICAL FIX ---
-    # Create a copy of the current environment variables
-    env = os.environ.copy()
-    
-    # Check if the secret is available in Streamlit's secrets manager
-    if "DB_CONNECTION_STRING" in st.secrets:
-        # Add the secret to the environment for the subprocess
-        env["DB_CONNECTION_STRING"] = st.secrets["DB_CONNECTION_STRING"]
-        print("Database secret found and passed to API subprocess.")
-    else:
-        # If the secret is missing, we cannot proceed.
-        print("🚨 CRITICAL: DB_CONNECTION_STRING not found in Streamlit secrets.")
-        st.error("Database secret is not set. The backend API cannot start.", icon="🔥")
-        return False
-    # --- END OF FIX ---
-
     try:
         cmd = ["uvicorn", "pod_agent.api:app", "--host", "0.0.0.0", "--port", "8000"]
-        # Pass the modified environment to the subprocess
-        process = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        # Use DEVNULL to hide subprocess output from Streamlit logs unless needed for deep debugging
+        process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         st.session_state.fastapi_process = process
         
-        max_wait_time = 25
+        # Wait for the API to become responsive
+        max_wait_time = 30 # Increased for cloud environment
         for i in range(max_wait_time):
             try:
                 response = requests.get(f"{api_base_url}/", timeout=1)
@@ -69,13 +55,10 @@ def start_fastapi_server():
                     print("FastAPI server is running and responsive.")
                     return True
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+                print(f"Waiting for API... ({i+1}/{max_wait_time})")
                 time.sleep(1)
                 
         print("FastAPI server failed to become responsive.")
-        # Print any errors from the subprocess for debugging
-        stdout, stderr = process.communicate()
-        print(f"FastAPI STDOUT: {stdout}")
-        print(f"FastAPI STDERR: {stderr}")
         stop_fastapi_server()
         return False
 
@@ -85,6 +68,7 @@ def start_fastapi_server():
         return False
 
 def stop_fastapi_server():
+    """Stops the FastAPI server using the handle from session state."""
     process = st.session_state.get("fastapi_process")
     if is_process_running(process):
         print("Stopping FastAPI server...")
@@ -97,7 +81,7 @@ def stop_fastapi_server():
             print("FastAPI server killed.")
         st.session_state.fastapi_process = None
 
-# --- Main API Status Check ---
+# --- Main API Status Check at the top of each rerun ---
 api_ready = False
 if is_process_running(st.session_state.get("fastapi_process")):
     try:
@@ -110,8 +94,7 @@ if not api_ready:
     if start_fastapi_server():
         api_ready = True
     else:
-        # The error message is now shown inside start_fastapi_server if secrets are missing
-        pass
+        st.error("Failed to start the backend API. Please check the app logs for details.", icon="🚨")
 
 # --- Data Caching Functions (Unchanged) ---
 @st.cache_data(ttl=3600)
@@ -134,8 +117,8 @@ def get_summary_data(include_future: bool):
         data = response.json().get('result', {})
         if not data: return pd.DataFrame()
         df = pd.DataFrame.from_dict(data, orient='index')
-        df.columns = df.columns.astype(str) # Ensure column names are strings
-        return df.style.format("{:,}")
+        df.columns = df.columns.astype(str)
+        return df
     except (requests.exceptions.RequestException, KeyError, ValueError) as e:
         st.warning(f"Could not fetch or parse summary data. Error: {e}")
         return pd.DataFrame()
@@ -189,7 +172,7 @@ if api_ready:
                         st.cache_data.clear()
                         st.rerun()
                     else:
-                        st.sidebar.error(f"API Error: {response.json().get('detail')}")
+                        st.sidebar.error(f"API Error: {response.json().get('detail', 'Unknown error')}")
                 except requests.exceptions.RequestException as e:
                     st.sidebar.error(f"Connection Error: {e}")
 else:
@@ -222,7 +205,7 @@ with col2:
 summary_df = get_summary_data(include_future=include_future_data)
 
 if summary_df is not None and not summary_df.empty:
-    st.dataframe(summary_df, use_container_width=True)
+    st.dataframe(summary_df.style.format("{:,}"), use_container_width=True)
 elif api_ready:
     st.info("No POD data found. Add transactions via the sidebar to see the summary.")
 else:
