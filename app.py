@@ -25,14 +25,12 @@ st.markdown("""
 
 api_base_url = "http://localhost:8000"
 
-# --- NEW: Initialize Session State for Process Handle ---
 if "fastapi_process" not in st.session_state:
     st.session_state.fastapi_process = None
 
 # --- Helper functions for managing the FastAPI process ---
 
 def is_process_running(process_obj):
-    """Checks if a Popen process object is still running."""
     if process_obj is None:
         return False
     return process_obj.poll() is None
@@ -40,12 +38,29 @@ def is_process_running(process_obj):
 def start_fastapi_server():
     """Starts the FastAPI server and stores the handle in session state."""
     print("Attempting to start FastAPI server...")
+
+    # --- THIS IS THE CRITICAL FIX ---
+    # Create a copy of the current environment variables
+    env = os.environ.copy()
+    
+    # Check if the secret is available in Streamlit's secrets manager
+    if "DB_CONNECTION_STRING" in st.secrets:
+        # Add the secret to the environment for the subprocess
+        env["DB_CONNECTION_STRING"] = st.secrets["DB_CONNECTION_STRING"]
+        print("Database secret found and passed to API subprocess.")
+    else:
+        # If the secret is missing, we cannot proceed.
+        print("🚨 CRITICAL: DB_CONNECTION_STRING not found in Streamlit secrets.")
+        st.error("Database secret is not set. The backend API cannot start.", icon="🔥")
+        return False
+    # --- END OF FIX ---
+
     try:
         cmd = ["uvicorn", "pod_agent.api:app", "--host", "0.0.0.0", "--port", "8000"]
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        # Pass the modified environment to the subprocess
+        process = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         st.session_state.fastapi_process = process
         
-        # Wait for the API to become responsive
         max_wait_time = 25
         for i in range(max_wait_time):
             try:
@@ -56,9 +71,12 @@ def start_fastapi_server():
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
                 time.sleep(1)
                 
-        # If loop finishes without returning, it failed
         print("FastAPI server failed to become responsive.")
-        stop_fastapi_server() # Clean up the failed process
+        # Print any errors from the subprocess for debugging
+        stdout, stderr = process.communicate()
+        print(f"FastAPI STDOUT: {stdout}")
+        print(f"FastAPI STDERR: {stderr}")
+        stop_fastapi_server()
         return False
 
     except Exception as e:
@@ -67,7 +85,6 @@ def start_fastapi_server():
         return False
 
 def stop_fastapi_server():
-    """Stops the FastAPI server using the handle from session state."""
     process = st.session_state.get("fastapi_process")
     if is_process_running(process):
         print("Stopping FastAPI server...")
@@ -80,27 +97,21 @@ def stop_fastapi_server():
             print("FastAPI server killed.")
         st.session_state.fastapi_process = None
 
-# --- Main API Status Check at the top of each rerun ---
-
+# --- Main API Status Check ---
 api_ready = False
-# Check if the process handle exists and if the process is still running
 if is_process_running(st.session_state.get("fastapi_process")):
-    # If it is running, do a quick health check to make sure it's responsive
     try:
         if requests.get(f"{api_base_url}/", timeout=2).status_code == 200:
             api_ready = True
-        else: # Process is running but not responding
-            stop_fastapi_server() # Kill the unresponsive server
     except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
-        stop_fastapi_server() # Kill the unresponsive server
+        stop_fastapi_server()
 
-# If after all checks the API is not ready, try to start it
 if not api_ready:
     if start_fastapi_server():
         api_ready = True
     else:
-        st.error("Failed to start the backend API. Please check the app logs for details.", icon="🚨")
-
+        # The error message is now shown inside start_fastapi_server if secrets are missing
+        pass
 
 # --- Data Caching Functions (Unchanged) ---
 @st.cache_data(ttl=3600)
@@ -122,22 +133,12 @@ def get_summary_data(include_future: bool):
         response.raise_for_status()
         data = response.json().get('result', {})
         if not data: return pd.DataFrame()
-        # This simplified parsing should work with the updated API response
-        df = pd.read_json(data, orient='index')
-        # Handle MultiIndex from Series conversion
-        if isinstance(df.index, pd.MultiIndex):
-            pivot_df = df[0].unstack().fillna(0).astype(int)
-        else: # Handle single index (e.g., just 'Net PODs')
-            pivot_df = df.transpose()
-        
-        if not pivot_df.empty:
-            pivot_df['Grand Total'] = pivot_df.sum(axis=1)
-            pivot_df.loc['Grand Total'] = pivot_df.sum(axis=0)
-        return pivot_df
+        df = pd.DataFrame.from_dict(data, orient='index')
+        df.columns = df.columns.astype(str) # Ensure column names are strings
+        return df.style.format("{:,}")
     except (requests.exceptions.RequestException, KeyError, ValueError) as e:
         st.warning(f"Could not fetch or parse summary data. Error: {e}")
         return pd.DataFrame()
-
 
 # --- Sidebar ---
 st.sidebar.header("Actions")
@@ -145,7 +146,6 @@ st.sidebar.header("Actions")
 if api_ready:
     st.sidebar.markdown("<span class='api-status-success'>✅ Backend API is running.</span>", unsafe_allow_html=True)
     
-    # --- Data Entry Form ---
     st.sidebar.header("Log a New Transaction")
     master_data = get_master_data()
     with st.sidebar.form("transaction_form", clear_on_submit=True):
@@ -171,7 +171,6 @@ if api_ready:
                 except requests.exceptions.RequestException as e:
                     st.error(f"Connection Error: {e}")
 
-    # --- Bulk Upload ---
     st.sidebar.divider()
     st.sidebar.header("Bulk Upload Transactions")
     uploaded_file = st.sidebar.file_uploader("Choose a CSV file", type="csv")
@@ -198,7 +197,6 @@ else:
     if st.sidebar.button("Retry API Connection"):
         st.rerun()
 
-
 # --- Main Page Content ---
 st.header("POD Summaries")
 view_option = st.radio("Select View:", ("Current PODs (As of Today)", "Future State (Including All Plans)"), horizontal=True, index=1)
@@ -223,13 +221,12 @@ with col2:
 
 summary_df = get_summary_data(include_future=include_future_data)
 
-if not summary_df.empty:
-    st.dataframe(summary_df.style.format("{:,}"), use_container_width=True)
+if summary_df is not None and not summary_df.empty:
+    st.dataframe(summary_df, use_container_width=True)
 elif api_ready:
     st.info("No POD data found. Add transactions via the sidebar to see the summary.")
 else:
     st.info("API is not running. Cannot display summary.")
-
 
 # --- Chat Interface ---
 st.divider()
@@ -237,13 +234,11 @@ st.header("Ask me about PODs")
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# The container for chat messages
 chat_container = st.container(height=400)
 for message in st.session_state.messages:
     with chat_container.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# The chat input box
 if prompt := st.chat_input("How many PODs are planned for January 2026?"):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with chat_container.chat_message("user"):
