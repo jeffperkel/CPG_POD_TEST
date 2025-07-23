@@ -14,3 +14,20 @@ streamlit
 requests
 psutil
 toml  # <-- ADD THIS LINE
+# requirements.txt
+
+# --- Core Web Framework & Server ---
+fastapi
+uvicorn
+gunicorn          # Production-grade web server for Python
+
+# --- Database & Data ---
+sqlalchemy
+psycopg2-binary   # PostgreSQL driver
+pandas
+openpyxl          # Needed for pandas Excel writing
+
+# --- AI & Utilities ---
+openai
+python-dotenv
+thefuzz           # For fuzzy string matching in your logic
