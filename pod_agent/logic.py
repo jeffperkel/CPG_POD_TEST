@@ -14,50 +14,45 @@ load_dotenv()
 client = OpenAI()
 FUZZY_MATCH_THRESHOLD = 80
 
-def classify_intent(user_input):
-    command_word = user_input.lower().split()[0]
-    if command_word in ['bulk_add', 'export']: return command_word
-    system_prompt = "You are an intent classifier. Respond with JSON: {\"intent\": \"log_data\"} for adding/losing PODs, or {\"intent\": \"query_data\"} for questions/summaries."
-    response = client.chat.completions.create(model="gpt-4o", messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_input}], response_format={"type": "json_object"}, temperature=0)
-    return json.loads(response.choices[0].message.content).get("intent")
-
-def find_best_match(query, valid_choices_list):
-    if not query: return None
-    best_match, score = process.extractOne(str(query).lower(), valid_choices_list)
-    return best_match if score >= FUZZY_MATCH_THRESHOLD else None
-
 def validate_and_enrich_data(parsed_data, user_id, source):
-    product_input = parsed_data.get("product_name") or parsed_data.get("Product") or parsed_data.get("sku_name")
-    retailer_input = parsed_data.get("retailer_name") or parsed_data.get("Retailer")
-    quantity_input = parsed_data.get("quantity") or parsed_data.get("Quantity")
-    intent_input = parsed_data.get("status") or parsed_data.get("Status")
-    date_input = parsed_data.get("effective_date") or parsed_data.get("Date")
+    """Validates a single transaction record."""
+    if database.engine is None:
+        raise ConnectionError("Database is not connected.")
 
-    if not all([product_input, retailer_input, quantity_input, intent_input]):
-        raise ValueError("Missing one or more required fields: product, retailer, quantity, status.")
+    product_input = parsed_data.get("product_name")
+    retailer_input = parsed_data.get("retailer_name")
+    quantity_input = parsed_data.get("quantity")
+    intent_input = parsed_data.get("status")
+    date_input = parsed_data.get("effective_date")
+
+    if not all([product_input, retailer_input, quantity_input, intent_input, date_input]):
+        raise ValueError("Missing one or more required fields.")
 
     valid_retailer_names = database.get_master_data_from_db('retailers', 'retailer_name')
     matched_retailer_name = find_best_match(retailer_input, valid_retailer_names)
-    if not matched_retailer_name: raise ValueError(f"Invalid Retailer: '{retailer_input}'.")
+    if not matched_retailer_name:
+        raise ValueError(f"Invalid Retailer: '{retailer_input}'.")
 
-    all_retailers_df = pd.DataFrame(database.get_master_data_from_db('retailers', '*'), columns=['id', 'retailer_key', 'retailer_name', 'division'])
-    retailer_key_row = all_retailers_df[all_retailers_df['retailer_name'] == matched_retailer_name]
-    if retailer_key_row.empty: raise ValueError(f"Could not map retailer name '{matched_retailer_name}' to a key.")
-    matched_retailer_key = retailer_key_row.iloc[0]['retailer_key']
+    all_retailers = database.get_master_data_from_db('retailers', '*')
+    all_retailers_df = pd.DataFrame(all_retailers, columns=['id', 'retailer_key', 'retailer_name', 'division'])
+    retailer_row = all_retailers_df[all_retailers_df['retailer_name'] == matched_retailer_name]
+    if retailer_row.empty:
+        raise ValueError(f"Could not map retailer name '{matched_retailer_name}' to a key.")
+    matched_retailer_key = retailer_row.iloc[0]['retailer_key']
 
     valid_skus = database.get_master_data_from_db('skus', 'product_name')
     matched_product_name = find_best_match(product_input, valid_skus)
-    if not matched_product_name: raise ValueError(f"Invalid Product: '{product_input}'.")
+    if not matched_product_name:
+        raise ValueError(f"Invalid Product: '{product_input}'.")
 
     db_info = database.get_info_from_names(matched_product_name, matched_retailer_key)
-    if not db_info: raise ValueError("Could not retrieve IDs for product/retailer combination.")
+    if not db_info:
+        raise ValueError("Could not retrieve IDs for product/retailer combination.")
     
-    validated_date = pd.to_datetime(date_input).date() if pd.notna(date_input) else date.today()
+    validated_date = pd.to_datetime(date_input).date()
     intent = str(intent_input).lower()
     quantity = int(quantity_input)
-    final_status = ""
-    quantity_changed = 0
-
+    
     if intent == 'planned':
         quantity_changed = abs(quantity)
         final_status = 'planned' if validated_date > date.today() else 'live'
@@ -65,10 +60,9 @@ def validate_and_enrich_data(parsed_data, user_id, source):
         quantity_changed = -abs(quantity)
         final_status = 'lost'
     else:
-        raise ValueError(f"Invalid action intent: '{intent}'. Must be 'planned' or 'lost'.")
+        raise ValueError(f"Invalid status: '{intent}'. Must be 'planned' or 'lost'.")
     
     trx_id = f"{db_info['sku_id']}-{db_info['retailer_id']}-{time.time()}"
-
     return {
         "trx_id": trx_id, "sku_id": db_info['sku_id'], "retailer_id": db_info['retailer_id'],
         "product_name": matched_product_name, "retailer_name": db_info['retailer_name'],
@@ -79,35 +73,26 @@ def validate_and_enrich_data(parsed_data, user_id, source):
     }
 
 def process_new_transaction(validated_data):
-    # Add a guard clause here as well for single transactions
+    """Processes a single validated transaction."""
     if database.engine is None:
-        raise ConnectionError("Database is not connected. Cannot process transaction.")
+        raise ConnectionError("Database is not connected.")
         
     if validated_data['quantity_changed'] < 0:
-        total_on_effective_date = database.get_total_for_item_by_date(
-            sku_id=validated_data['sku_id'], retailer_id=validated_data['retailer_id'],
-            effective_date=validated_data['effective_date']
+        total = database.get_total_for_item_by_date(
+            validated_data['sku_id'], validated_data['retailer_id'], validated_data['effective_date']
         )
-        quantity_to_lose = abs(validated_data['quantity_changed'])
-        if quantity_to_lose > total_on_effective_date:
-            raise ValueError(f"Invalid transaction: Cannot lose {quantity_to_lose} PODs. Projected total on {validated_data['effective_date']} for '{validated_data['product_name']}' at '{validated_data['retailer_name']}' will only be {total_on_effective_date}.")
+        if abs(validated_data['quantity_changed']) > total:
+            raise ValueError(f"Cannot lose more PODs than exist. Projected total is {total}.")
             
     if database.check_for_duplicate(validated_data):
         raise ValueError("Duplicate transaction detected.")
     
     database.insert_transaction(validated_data)
-    return True
 
 def process_bulk_file(file_stream, user_id):
-    """
-    Processes a bulk CSV file efficiently by fetching master data once and using
-    a single database transaction for all valid rows.
-    """
-    # --- THIS IS THE CRITICAL FIX ---
-    # Add a guard clause to fail fast if the database isn't connected.
+    """Processes a bulk CSV file efficiently."""
     if database.engine is None:
-        raise ConnectionError("Database is not connected. Cannot process bulk file.")
-    # --- END OF FIX ---
+        raise ConnectionError("Database is not connected.")
 
     try:
         bulk_df = pd.read_csv(file_stream)
@@ -115,54 +100,42 @@ def process_bulk_file(file_stream, user_id):
     except Exception as e:
         raise ValueError(f"Could not parse CSV file: {e}")
 
-    print("Fetching master data for bulk validation...")
-    all_skus_df = pd.read_sql("SELECT id, product_name FROM skus", database.engine)
-    all_retailers_df = pd.read_sql("SELECT id, retailer_name FROM retailers", database.engine)
-    
-    sku_lookup = {name.lower(): id for name, id in zip(all_skus_df['product_name'], all_skus_df['id'])}
-    retailer_lookup = {name.lower(): id for name, id in zip(all_retailers_df['retailer_name'], all_retailers_df['id'])}
+    all_skus = pd.read_sql("SELECT id, product_name FROM skus", database.engine)
+    all_retailers = pd.read_sql("SELECT id, retailer_name FROM retailers", database.engine)
+    sku_lookup = {name.lower(): id for name, id in zip(all_skus['product_name'], all_skus['id'])}
+    retailer_lookup = {name.lower(): id for name, id in zip(all_retailers['retailer_name'], all_retailers['id'])}
 
-    enriched_transactions = []
-    errors = []
-
-    print(f"Validating {len(bulk_df)} rows from CSV...")
+    enriched_transactions, errors = [], []
     for index, row in bulk_df.iterrows():
         try:
-            required_cols = ['product_name', 'retailer_name', 'quantity', 'status', 'effective_date']
-            if not all(k in row and pd.notna(row[k]) for k in required_cols):
-                raise ValueError(f"Missing data in one of required columns: {', '.join(required_cols)}")
-
+            # Similar validation logic as the single transaction, but using the efficient lookups
             product_input = str(row['product_name']).lower()
             retailer_input = str(row['retailer_name']).lower()
 
-            matched_prod_name, prod_score = process.extractOne(product_input, sku_lookup.keys())
-            matched_ret_name, ret_score = process.extractOne(retailer_input, retailer_lookup.keys())
+            matched_prod, _ = process.extractOne(product_input, sku_lookup.keys())
+            matched_ret, _ = process.extractOne(retailer_input, retailer_lookup.keys())
 
-            if prod_score < FUZZY_MATCH_THRESHOLD or ret_score < FUZZY_MATCH_THRESHOLD:
-                raise ValueError(f"Could not reliably match Product '{row['product_name']}' or Retailer '{row['retailer_name']}'")
-
-            sku_id = sku_lookup[matched_prod_name]
-            retailer_id = retailer_lookup[matched_ret_name]
-            
             validated_date = pd.to_datetime(row['effective_date']).date()
             intent = str(row['status']).lower()
             quantity = int(row['quantity'])
-            
+
             if intent == 'planned':
                 quantity_changed = abs(quantity)
-                final_status = 'planned' if validated_date > date.today() else 'live'
+                status = 'planned' if validated_date > date.today() else 'live'
             elif intent == 'lost':
                 quantity_changed = -abs(quantity)
-                final_status = 'lost'
+                status = 'lost'
             else:
-                raise ValueError(f"Invalid status: '{row['status']}'. Must be 'planned' or 'lost'.")
+                raise ValueError(f"Invalid status: '{intent}'")
             
+            sku_id = sku_lookup[matched_prod]
+            retailer_id = retailer_lookup[matched_ret]
             trx_id = f"{sku_id}-{retailer_id}-{time.time()}"
-
+            
             enriched_transactions.append({
                 "trx_id": trx_id, "sku_id": sku_id, "retailer_id": retailer_id,
-                "product_name": matched_prod_name.title(), "retailer_name": matched_ret_name.title(),
-                "status": final_status, "quantity_changed": quantity_changed,
+                "product_name": matched_prod.title(), "retailer_name": matched_ret.title(),
+                "status": status, "quantity_changed": quantity_changed,
                 "effective_date": validated_date.strftime("%Y-%m-%d"),
                 "log_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "user_id": user_id, "source": "bulk_upload"
@@ -170,169 +143,127 @@ def process_bulk_file(file_stream, user_id):
         except Exception as e:
             errors.append(f"Row {index + 2}: {e}")
 
-    if not enriched_transactions:
-        print("No valid transactions found after validation.")
-        return 0, errors
+    if not enriched_transactions: return 0, errors
 
+    # Intra-file consistency check for losses
     enriched_transactions.sort(key=lambda x: (x['effective_date'], x['log_timestamp']))
-    
-    temp_state = {}
-    final_transactions_to_insert = []
-    print("Performing consistency check for losses...")
+    temp_state, final_transactions = {}, []
     for trx in enriched_transactions:
         key = (trx['sku_id'], trx['retailer_id'])
-        current_total_in_file = temp_state.get(key, 0)
+        db_total = database.get_total_for_item_by_date(trx['sku_id'], trx['retailer_id'], trx['effective_date'])
+        file_total = temp_state.get(key, 0)
         
-        projected_total_in_db = database.get_total_for_item_by_date(trx['sku_id'], trx['retailer_id'], trx['effective_date'])
+        if trx['quantity_changed'] < 0 and abs(trx['quantity_changed']) > (db_total + file_total):
+            errors.append(f"Row for {trx['product_name']}: Trying to lose {abs(trx['quantity_changed'])}, but projected total is only {db_total + file_total}.")
+            continue
         
-        combined_projected_total = projected_total_in_db + current_total_in_file
+        temp_state[key] = file_total + trx['quantity_changed']
+        final_transactions.append(trx)
 
-        if trx['quantity_changed'] < 0:
-            quantity_to_lose = abs(trx['quantity_changed'])
-            if quantity_to_lose > combined_projected_total:
-                errors.append(f"Row for '{trx['product_name']}' on {trx['effective_date']}: Trying to lose {quantity_to_lose}, but projected total (DB + File) is only {combined_projected_total}.")
-                continue
-        
-        temp_state[key] = current_total_in_file + trx['quantity_changed']
-        final_transactions_to_insert.append(trx)
-
-    if final_transactions_to_insert:
-        print(f"Attempting to insert {len(final_transactions_to_insert)} valid transactions...")
+    # Final DB insertion in a single transaction
+    if final_transactions:
         with database.engine.connect() as conn:
             with conn.begin() as transaction:
                 try:
-                    for trx_data in final_transactions_to_insert:
+                    for trx_data in final_transactions:
                         database.insert_transaction(trx_data, conn=conn)
-                    print("Database insert successful, committing transaction.")
                 except Exception as e:
-                    errors.append(f"Database batch insert failed, rolling back. Error: {e}")
-                    print(f"Database batch insert failed, rolling back. Error: {e}")
-                    # The 'with conn.begin()' automatically rolls back on exception
+                    transaction.rollback()
+                    errors.append(f"Database batch insert failed: {e}")
                     return 0, errors
+    return len(final_transactions), errors
 
-    return len(final_transactions_to_insert), errors
 
 def generate_query_plan(user_query):
-    db_schema_info = {"columns": ["retailer", "product_name", "division", "status", "effective_date"], "notes": "Map user synonyms: 'customer'->'retailer', 'item'->'product_name'."}
-    system_prompt = f"You are a data query planner. Translate a question into JSON with 'filters', 'group_by', and 'include_future_dates' keys. Column names must be from this schema: {json.dumps(db_schema_info)}. Set `include_future_dates` to `true` for reporting/timelines, `false` for current state."
+    db_schema_info = {"columns": ["retailer", "product_name", "division", "status", "effective_date"]}
+    system_prompt = f"You are a data query planner. Translate a question into JSON with 'filters', 'group_by', and 'include_future_dates' keys. Columns from: {json.dumps(db_schema_info)}. Set `include_future_dates` to `true` for future reporting, `false` for current state."
     response = client.chat.completions.create(model="gpt-4o", messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_query}], response_format={"type": "json_object"}, temperature=0)
     return json.loads(response.choices[0].message.content)
 
 def execute_query_plan(query_plan, include_future_dates_explicit: bool):
     df = database.get_all_transactions_as_dataframe()
-    group_by_cols = query_plan.get("group_by", [])
     if df is None or df.empty:
-        if group_by_cols:
-            return pd.DataFrame(columns=group_by_cols + ['quantity_changed']).set_index(group_by_cols)
-        return pd.DataFrame({'Net PODs': [0]}).set_index('Net PODs')
-
+        return pd.DataFrame()
     df['effective_date'] = pd.to_datetime(df['effective_date']).dt.date
     results_df = df.copy()
-
     if not include_future_dates_explicit:
         results_df = results_df[results_df['effective_date'] <= date.today()]
-
+    
     filters = query_plan.get("filters", {})
-    if filters:
-        for column, value in filters.items():
-            if column in results_df.columns and value:
-                results_df = results_df[results_df[column].astype(str).str.contains(str(value), case=False, na=False)]
-
-    if results_df.empty:
-        if group_by_cols:
-            return pd.DataFrame(columns=group_by_cols + ['quantity_changed']).set_index(group_by_cols)
-        return pd.DataFrame({'Net PODs': [0]}).set_index('Net PODs')
-        
+    for column, value in filters.items():
+        if column in results_df.columns and value:
+            results_df = results_df[results_df[column].astype(str).str.contains(str(value), case=False, na=False)]
+    
+    group_by_cols = query_plan.get("group_by", [])
     if group_by_cols:
-        valid_group_cols = [col for col in group_by_cols if col in results_df.columns]
-        if not valid_group_cols:
-            total_sum = results_df['quantity_changed'].sum()
-            return pd.Series([total_sum], index=['Net PODs'], name='value').to_frame()
-        final_results = results_df.groupby(valid_group_cols)['quantity_changed'].sum().reset_index()
-        return final_results.rename(columns={'quantity_changed': 'value'})
+        valid_cols = [c for c in group_by_cols if c in results_df.columns]
+        if not valid_cols:
+            return pd.DataFrame({'value': [results_df['quantity_changed'].sum()]})
+        return results_df.groupby(valid_cols)['quantity_changed'].sum().reset_index().rename(columns={'quantity_changed': 'value'})
     else:
-        total_sum = results_df['quantity_changed'].sum()
-        return pd.DataFrame({'value': [total_sum]}, index=['Net PODs'])
-
-def generate_conversational_response(user_query):
-    query_plan = generate_query_plan(user_query)
-    filters = query_plan.get("filters", {})
-    filtered_retailer = filters.get("retailer")
-    filtered_product = filters.get("product_name")
-    df = database.get_all_transactions_as_dataframe()
-    current_date_str = date.today().strftime("%Y-%m-%d")
-    today = date.today()
-    if df is None or df.empty:
-        return f"As of {current_date_str}, the database is empty."
-    df_copy = df.copy()
-    df_copy['effective_date'] = pd.to_datetime(df_copy['effective_date'], errors='coerce').dt.date
-    df_copy.dropna(subset=['effective_date'], inplace=True)
-    if filtered_retailer:
-        df_copy = df_copy[df_copy['retailer'].str.contains(filtered_retailer, case=False, na=False)]
-    if filtered_product:
-        df_copy = df_copy[df_copy['product_name'].str.contains(filtered_product, case=False, na=False)]
-    if df_copy.empty:
-        return f"I couldn't find any POD data matching your query."
-    current_mask = df_copy['effective_date'] <= today
-    current_df = df_copy[current_mask]
-    current_net_pods = current_df['quantity_changed'].sum()
-    future_mask = df_copy['effective_date'] > today
-    future_df = df_copy[future_mask].copy()
-    future_changes_list_str = ""
-    future_net_change_amount = 0
-    if not future_df.empty:
-        future_df = future_df.sort_values(by='effective_date', ascending=True)
-        future_changes_lines = []
-        for _, row in future_df.iterrows():
-            change_type = "Loss" if row['quantity_changed'] < 0 else "Gain"
-            future_changes_lines.append(f"- {change_type} of {abs(row['quantity_changed']):,} {row['product_name']} at {row['retailer']} on {row['effective_date'].strftime('%Y-%m-%d')}")
-        future_changes_list_str = "\n".join(future_changes_lines)
-        future_net_change_amount = future_df['quantity_changed'].sum()
-    else:
-        future_changes_list_str = "No specific future changes found for this query."
-    overall_future_total = current_net_pods + future_net_change_amount
-    system_prompt = f"""You are a helpful, extremely concise, and accurate CPG sales analyst.
-User's original query: "{user_query}"
----
-[PRE-CALCULATED DATA FOR YOUR RESPONSE]
-Current Date: {current_date_str}
-Current_Net_PODs_Calculated: {current_net_pods}
-Overall_Future_Total_Calculated: {overall_future_total}
-Detailed_Future_Changes_List:
-{future_changes_list_str}
----
-Your response MUST be structured as two parts..."""
-    response = client.chat.completions.create(model="gpt-4o", messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_query}], temperature=0.0)
-    return response.choices[0].message.content
+        return pd.DataFrame({'value': [results_df['quantity_changed'].sum()]})
 
 def get_export_data_for_both_views():
-    current_export_plan = {"filters": {}, "group_by": ["product_name", "retailer"]}
-    current_data = execute_query_plan(current_export_plan, include_future_dates_explicit=False)
-    
-    future_export_plan = {"filters": {}, "group_by": ["product_name", "retailer"]}
-    future_data = execute_query_plan(future_export_plan, include_future_dates_explicit=True)
-
-    current_df_processed = _process_for_export(current_data)
-    future_df_processed = _process_for_export(future_data)
-
-    return current_df_processed, future_df_processed
+    plan = {"group_by": ["product_name", "retailer"]}
+    current_data = execute_query_plan(plan, include_future_dates_explicit=False)
+    future_data = execute_query_plan(plan, include_future_dates_explicit=True)
+    return _process_for_export(current_data), _process_for_export(future_data)
 
 def _process_for_export(data_df):
     if data_df is None or data_df.empty or 'value' not in data_df.columns:
         return pd.DataFrame()
     try:
-        pivot_table = data_df.pivot(index='product_name', columns='retailer', values='value').fillna(0).astype(int)
-        
-        if not pivot_table.empty:
-            pivot_table['Grand Total'] = pivot_table.sum(axis=1)
-            pivot_table.loc['Grand Total'] = pivot_table.sum(axis=0)
-        
-        return pivot_table
-        
-    except Exception as e:
-        print(f"Error during pivot for export: {e}")
-        return pd.DataFrame()
+        pivot = data_df.pivot(index='product_name', columns='retailer', values='value').fillna(0).astype(int)
+        if not pivot.empty:
+            pivot['Grand Total'] = pivot.sum(axis=1)
+            pivot.loc['Grand Total'] = pivot.sum(axis=0)
+        return pivot
+    except Exception:
+        return data_df # Return unpivoted if pivot fails
 
-def get_transaction_log():
-    log_df = database.get_recent_transactions()
-    return log_df
+def generate_conversational_response(user_query):
+    # This function uses the LLM to generate a plan and then data to answer a question.
+    query_plan = generate_query_plan(user_query)
+    # The logic here would be more complex, involving executing the plan and formatting the results.
+    # For now, we'll keep it simple and just show the plan.
+    # In a real scenario, you'd call execute_query_plan and then feed the results to another LLM prompt.
+    
+    data_df = database.get_all_transactions_as_dataframe()
+    if data_df is None or data_df.empty:
+        return "The database is empty. I have no data to answer your question."
+
+    # A more sophisticated version would use the query plan to get specific data
+    # For now, we use a simpler, direct calculation for the conversational response
+    
+    today = date.today()
+    data_df['effective_date'] = pd.to_datetime(data_df['effective_date']).dt.date
+    
+    current_pods = data_df[data_df['effective_date'] <= today]['quantity_changed'].sum()
+    future_changes = data_df[data_df['effective_date'] > today]
+    future_net_change = future_changes['quantity_changed'].sum()
+    future_total = current_pods + future_net_change
+
+    future_summary_lines = []
+    if not future_changes.empty:
+        for _, row in future_changes.sort_values('effective_date').head(5).iterrows():
+            change = "gain" if row['quantity_changed'] > 0 else "loss"
+            future_summary_lines.append(f"- A {change} of {abs(row['quantity_changed'])} for {row['product_name']} at {row['retailer']} on {row['effective_date']}")
+    
+    context = f"""
+    Current total PODs as of today ({today.strftime('%Y-%m-%d')}): {current_pods:,}
+    Net change from future-dated transactions: {future_net_change:+,}
+    Projected future total PODs: {future_total:,}
+    Key upcoming changes:
+    {''.join(future_summary_lines) if future_summary_lines else "- None in the near future."}
+    """
+    
+    system_prompt = f"You are a helpful CPG analyst. Based on the data below, answer the user's question concisely. \n\nDATA CONTEXT:\n{context}"
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_query}
+        ],
+        temperature=0.1
+    )
+    return response.choices[0].message.content
